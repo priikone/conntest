@@ -1,14 +1,14 @@
 /*
 
-  conntest.c 
+  conntest.c
 
-  Copyright (c) 1999, 2001 Pekka Riikonen, priikone@silcnet.org.
+  Copyright (c) 1999 - 2009 Pekka Riikonen, priikone@iki.fi.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
   the Free Software Foundation; either version 2 of the License, or
   (at your option) any later version.
- 
+
   This program is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
@@ -74,21 +74,35 @@ int e_unique = 0;
 int e_random_ip = 0;
 int e_pmtu = -1;
 int e_ttl = -1;
+int e_time;
+unsigned int e_quiet = 0;
 
 #define MAX_SOCKETS 20000
 
-static char ip4_header[20] = "\x45\x00\x00\x00\x00\x00\x00\x00\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+static unsigned char ip4_header[20] = "\x45\x00\x00\x00\x00\x00\x00\x00\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 
 struct sockets {
   int sockets[MAX_SOCKETS];
-  char ip4h[MAX_SOCKETS][20];
+  unsigned char ip4h[MAX_SOCKETS][20];
   struct sockaddr_in udp_dest[MAX_SOCKETS];
   int num_sockets;
 };
 
-#define PUT32(d, n) (d)[0] = n >> 24 & 0xff; (d)[1] = n >> 16 & 0xff; (d)[2] = n >> 8 & 0xff; (d)[3] = n & 0xff;
+#define PUT32(d, n)							\
+do {									\
+  (d)[0] = n >> 24 & 0xff;						\
+  (d)[1] = n >> 16 & 0xff;						\
+  (d)[2] = n >> 8 & 0xff;						\
+  (d)[3] = n & 0xff;							\
+} while(0)
 
-void thread_data_send(struct sockets *s, int offset, int num, 
+#define SWAB32(l) ((unsigned int)					\
+   (((unsigned int)(l) & (unsigned int)0x000000FFUL) << 24) |		\
+   (((unsigned int)(l) & (unsigned int)0x0000FF00UL) << 8)  |		\
+   (((unsigned int)(l) & (unsigned int)0x00FF0000UL) >> 8)  |		\
+   (((unsigned int)(l) & (unsigned int)0xFF000000UL) >> 24))
+
+void thread_data_send(struct sockets *s, int offset, int num,
                       int loop, void *data, int datalen, int flood);
 
 /* Convert HEX string to binary data */
@@ -119,7 +133,7 @@ unsigned char *hex2data(const char *hex, int *ret_data_len)
 }
 
 /* Set socket option */
-void set_sockopt(int socket, int t, int s, int val)
+int set_sockopt(int socket, int t, int s, int val)
 {
   int option = val;
   if (setsockopt(socket, t, s,
@@ -127,8 +141,9 @@ void set_sockopt(int socket, int t, int s, int val)
                  sizeof(int)) < 0)
     {
       fprintf(stderr, "setsockopt(): %s\n", strerror(errno));
-      exit(1);
+      return -1;
     }
+  return 0;
 }
 
 /* Creates a new TCP/IP or UDP/IP connection. Returns the newly created
@@ -143,7 +158,7 @@ int create_connection(int port, char *dhost, int index,
 #ifdef WIN32
   unsigned long addr;
 #endif
-  char *ip4h = sockets->ip4h[index];
+  unsigned char *ip4h = sockets->ip4h[index];
 
   memcpy(ip4h, ip4_header, 20);
 
@@ -239,9 +254,10 @@ int create_connection(int port, char *dhost, int index,
 
   /* connect to the host */
   if (e_proto == SOCK_STREAM) {
-    fprintf(stderr, "Connecting to port %d of host %s (%s).", port,
-	    dhost ? dhost : "N/A",
-	    dhost ? inet_ntoa(desthost.sin_addr) : "N/A");
+    if (!e_quiet)
+      fprintf(stderr, "Connecting to port %d of host %s (%s).", port,
+	      dhost ? dhost : "N/A",
+	      dhost ? inet_ntoa(desthost.sin_addr) : "N/A");
 
     i = connect(sock, (struct sockaddr *)&desthost, sizeof(desthost));
     if (i < 0) {
@@ -249,19 +265,37 @@ int create_connection(int port, char *dhost, int index,
       shutdown(sock, 2);
       close(sock);
     } else {
-      fprintf(stderr, " Done.\n");
+      if (!e_quiet)
+	fprintf(stderr, " Done.\n");
       set_sockopt(sock, IPPROTO_TCP, TCP_NODELAY, 1);
       sockets->sockets[index] = sock;
       set_sockopt(sock, SOL_SOCKET, SO_BROADCAST, 1);
+#if defined(SO_SNDBUF)
+      if (set_sockopt(sock, SOL_SOCKET, SO_SNDBUF, 1000000) < 0)
+	set_sockopt(sock, SOL_SOCKET, SO_SNDBUF, 65535);
+#endif /* SO_SNDBUF */
+#if defined(SO_SNDBUFFORCE)
+      if (set_sockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, 1000000) < 0)
+	set_sockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, 65535);
+#endif /* SO_SNDBUFFORCE */
       return sock;
     }
   } else {
-    fprintf(stderr, "Sending data to port %d of host %s (%s).\n", port,
-	    dhost ? dhost : "N/A",
-	    dhost ? inet_ntoa(desthost.sin_addr) : "N/A");
+    if (!e_quiet)
+      fprintf(stderr, "Sending data to port %d of host %s (%s).\n", port,
+	      dhost ? dhost : "N/A",
+	      dhost ? inet_ntoa(desthost.sin_addr) : "N/A");
     sockets->sockets[index] = sock;
     memcpy(&sockets->udp_dest[index], &desthost, sizeof(desthost));
     set_sockopt(sock, SOL_SOCKET, SO_BROADCAST, 1);
+#if defined(SO_SNDBUF)
+    if (set_sockopt(sock, SOL_SOCKET, SO_SNDBUF, 1000000) < 0)
+      set_sockopt(sock, SOL_SOCKET, SO_SNDBUF, 65535);
+#endif /* SO_SNDBUF */
+#if defined(SO_SNDBUFFORCE)
+    if (set_sockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, 1000000) < 0)
+      set_sockopt(sock, SOL_SOCKET, SO_SNDBUFFORCE, 65535);
+#endif /* SO_SNDBUFFORCE */
     return sock;
   }
 
@@ -284,7 +318,7 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
 {
   int ret, i;
   int sock = s->sockets[index];
-  char *ip4h = s->ip4h[index];
+  unsigned char *ip4h = s->ip4h[index];
   struct sockaddr_in *udp = &s->udp_dest[index];
   unsigned char *d = data;
 
@@ -299,20 +333,21 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
 
   /* Randomize source IP if requested */
   if (e_random_ip) {
-    ip4h[12] = d[12] ^= (time(NULL) + ((d[15] + 0x9d2c5681L) * 1812433253UL)) >> 11;
-    ip4h[13] = d[13] ^= d[12] ^ ((d[14] + 0x9d2c5689L) * 1812433253UL) >> 30;
-    ip4h[14] = d[14] ^= d[13] ^ ((d[13] + 0x7d2c5687L) * 1812433253UL) >> 7;
-    ip4h[15] = d[15] ^= d[14] ^ ((d[12] + 0x3d2c5683L) * 1812433253UL) >> 11;
-    if (d[12] == 0)
+    ip4h[12] = d[12] ^= (e_time ^ (e_time >> 11));
+    ip4h[13] = d[13] ^= d[12] ^ ((d[13] << 7) & 0x9d2c5680UL);
+    ip4h[14] = d[14] ^= d[13] ^ ((d[14] << 15) & 0xefc60000UL);
+    ip4h[15] = d[15] ^= d[14] ^ (d[15] >> 18);
+    if (d[12] == 0 || d[12] == 224 || d[12] == 255)
       ip4h[12] = d[12] = 1;
     if (d[15] == 255)
       ip4h[15] = d[15] = 1;
+    e_time += 2749;
   }
 
   /* Source IP range if requested */
   if (e_lip_start && e_lip_end) {
     if (e_lip_s > e_lip_e)
-      e_lip_s = 1;
+      e_lip_s = atoi(strrchr(e_lip_start, '.') + 1);
     ip4h[15] = d[15] = e_lip_s++;
   }
 
@@ -326,14 +361,15 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
     ret = sendto(sock, data, len, 0, (struct sockaddr *)udp, sizeof(*udp));
     if (ret < 0) {
       fprintf(stderr, "sendto(): %s\n", strerror(errno));
+      fprintf(stderr, "%x.%x.%x.%x\n", ip4h[12], ip4h[13], ip4h[14], ip4h[15]);
       return -1;
     }
   }
-    
+
   return 0;
 }
 
-void usage() 
+void usage()
 {
   printf("Usage: conntest OPTIONS\n");
   printf("Options:\n");
@@ -357,6 +393,7 @@ void usage()
   printf("  -u              Each packet will have unique data payload\n");
   printf("  -f              Flood, no delays creating connections (default: undefined)\n");
   printf("  -F              Flood, no delays between data sends (default: undefined)\n");
+  printf("  -q              Quiet, don't display anything\n");
   printf("  -V              Display version and help, then exit\n");
   printf("\n  Protocols:\n");
   printf("  -A <protocol>   Do <protocol> attack\n");
@@ -421,11 +458,12 @@ int main(int argc, char **argv)
   WORD ver = MAKEWORD( 2, 2 );
   WSADATA wsa_data;
 
-  if (WSAStartup(ver, &wsa_data)) 
+  if (WSAStartup(ver, &wsa_data))
     exit(1);
 
 #endif
 
+  e_time = time(NULL);
   e_num_conn = 1;
   e_data_len = 1024;
   e_send_loop = -1;
@@ -436,11 +474,18 @@ int main(int argc, char **argv)
 
   if (argc > 1) {
     k = 1;
-    while((opt = getopt(argc, argv, "Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:D:Q:L:K:uR:m:T:r")) != EOF) {
+    while((opt = getopt(argc, argv,
+			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:D:Q:L:K:uR:m:T:rq"))
+	  != EOF) {
       switch(opt) {
       case 'V':
-        fprintf(stderr, "ConnTest, version 1.11 (c) 1999, 2001, 2002, 2006, 2007, 2008 Pekka Riikonen\n");
+        fprintf(stderr,
+		"ConnTest, version 1.12 (c) 1999 - 2009 Pekka Riikonen\n");
         usage();
+        break;
+      case 'q':
+	e_quiet = 1;
+	k++;
         break;
       case 'h':
         k++;
@@ -591,7 +636,7 @@ int main(int argc, char **argv)
           usage();
 	if (strlen(argv[k]) > 2 && argv[k][0] == '0' && argv[k][1] == 'x') {
 	  e_header = (char *)hex2data(argv[k] + 2, &e_header_len);
-        } else { 
+        } else {
 	  e_header = strdup(argv[k]);
 	  e_header_len = strlen(e_header);
 	}
@@ -669,7 +714,7 @@ int main(int argc, char **argv)
     e_threads = 1;
 
   if (e_num_conn > MAX_SOCKETS) {
-    fprintf(stderr, "conntest: %d are maximum number of connections\n", 
+    fprintf(stderr, "conntest: %d are maximum number of connections\n",
             MAX_SOCKETS);
     exit(1);
   }
@@ -704,14 +749,16 @@ int main(int argc, char **argv)
       snprintf(ip, sizeof(ip) - 1, "%s.%d", tmp, k);
 
       for (i = 0; i < e_num_conn; i++) {
-	fprintf(stderr, "#%3d: ", i + 1);
+	if (!e_quiet)
+	  fprintf(stderr, "#%3d: ", i + 1);
       retry0:
 	if (create_connection(e_port, ip, count, &s) < 0) {
-	  fprintf(stderr, "Retrying after 30 seconds\n");
+	  if (!e_quiet)
+	    fprintf(stderr, "Retrying after 30 seconds\n");
 	  sleep(30);
 	  goto retry0;
 	}
-	
+
 	if (!e_flood)
 	 usleep(50000);
 	count++;
@@ -721,14 +768,16 @@ int main(int argc, char **argv)
   } else {
     /* create the connections */
     for (i = 0; i < e_num_conn; i++) {
-      fprintf(stderr, "#%3d: ", i + 1);
+      if (!e_quiet)
+	fprintf(stderr, "#%3d: ", i + 1);
     retry:
       if (create_connection(e_port, e_host, i, &s) < 0) {
-	fprintf(stderr, "Retrying after 30 seconds\n");
+	if (!e_quiet)
+	  fprintf(stderr, "Retrying after 30 seconds\n");
 	sleep(30);
 	goto retry;
       }
-      
+
       if (!e_flood)
 	usleep(50000);
     }
@@ -748,13 +797,15 @@ int main(int argc, char **argv)
   if (e_header) {
     if (e_proto == SOCK_RAW && (e_lip || e_sock_proto == IPPROTO_RAW)) {
       if (e_data_len - 20 < e_header_len) {
-        fprintf(stderr, "Data length (-d) is shorter than specified header (-D)\n");
+        fprintf(stderr,
+		"Data length (-d) is shorter than specified header (-D)\n");
         exit(1);
       }
       memcpy(data + 20, e_header, e_header_len);
     } else {
       if (e_data_len < e_header_len) {
-        fprintf(stderr, "Data length (-d) is shorter than specified header (-D)\n");
+        fprintf(stderr,
+		"Data length (-d) is shorter than specified header (-D)\n");
         exit(1);
       }
       memcpy(data, e_header, e_header_len);
@@ -763,7 +814,8 @@ int main(int argc, char **argv)
 
   /* do the data sending (if single thread) */
   if (e_threads == 1) {
-    fprintf(stderr, "Sending data (%d bytes) to connection n:o ", len);
+    if (!e_quiet)
+      fprintf(stderr, "Sending data (%d bytes) to connection n:o ", len);
     if (e_send_loop < 0)
       k = -2;
     else
@@ -771,14 +823,16 @@ int main(int argc, char **argv)
 
     while(k < e_send_loop) {
       for (i = 0; i < s.num_sockets; i++) {
-        fprintf(stderr, "%5d\b\b\b\b\b", i + 1);
-        fflush(stderr);
-        
+	if (!e_quiet) {
+	  fprintf(stderr, "%5d\b\b\b\b\b", i + 1);
+	  fflush(stderr);
+	}
+
         if ((send_data(&s, i, data, len)) < 0) {
           free(data);
           exit(1);
         }
-        
+
         if (!e_data_flood) {
 	  if (e_sleep * 1000 < 1000000)
             usleep(e_sleep * 1000);
@@ -789,8 +843,8 @@ int main(int argc, char **argv)
       if (k >= 0)
         k++;
     }
-  } 
-#ifndef WIN32  
+  }
+#ifndef WIN32
     else {               /* >1 threads */
     int num, offset;
 
@@ -813,8 +867,10 @@ int main(int argc, char **argv)
     }
 
     /* Parent will take care of rest of the connections. */
-    fprintf(stderr, "Sending data (%d bytes) to connection n:o ", len);
-    fflush(stderr);
+    if (!e_quiet) {
+      fprintf(stderr, "Sending data (%d bytes) to connection n:o ", len);
+      fflush(stderr);
+    }
     if (e_send_loop < 0)
       k = -2;
     else
@@ -822,14 +878,16 @@ int main(int argc, char **argv)
 
     while(k < e_send_loop) {
       for (i = offset; i < e_num_conn; i++) {
-        fprintf(stderr, "%5d\b\b\b\b\b", i + 1);
-        fflush(stderr);
-        
+	if (!e_quiet) {
+	  fprintf(stderr, "%5d\b\b\b\b\b", i + 1);
+	  fflush(stderr);
+	}
+
         if ((send_data(&s, i, data, len)) < 0) {
           free(data);
           exit(1);
         }
-        
+
         if (!e_data_flood) {
 	  if (e_sleep * 1000 < 1000000)
             usleep(e_sleep * 1000);
@@ -844,7 +902,8 @@ int main(int argc, char **argv)
 #endif
   /* close the connections */
 
-  fprintf(stderr, "\nClosing connections.\n");
+  if (!e_quiet)
+    fprintf(stderr, "\nClosing connections.\n");
 
   for (i = 0; i < e_num_conn; i++)
     if ((close_connection(s.sockets[i])) < 0) {
@@ -860,7 +919,7 @@ int main(int argc, char **argv)
 
 /* Executing thread. This is the executing child process. */
 
-void thread_data_send(struct sockets *s, int offset, int num, 
+void thread_data_send(struct sockets *s, int offset, int num,
                       int loop, void *data, int datalen, int flood)
 {
   int i, k;
@@ -868,7 +927,7 @@ void thread_data_send(struct sockets *s, int offset, int num,
 
   /* log the connections */
   cp = buf;
-  k = sprintf(cp, "PID %d sends data (%d bytes) to connections: ", 
+  k = sprintf(cp, "PID %d sends data (%d bytes) to connections: ",
               getpid(), datalen);
   cp += k;
   for (i = offset, k = 0; i < num + offset; i++)
@@ -876,21 +935,23 @@ void thread_data_send(struct sockets *s, int offset, int num,
 
   SYSLOG((LOG_INFO, "%s\n", buf));
 
+  e_time = time(NULL) * 2;
+
   /* do the data sending */
   if (loop < 0)
     k = -2;
   else
     k = 0;
-  
+
   while(k < loop) {
     for (i = offset; i < num + offset; i++) {
       if ((send_data(s, i, data, datalen)) < 0) {
-        SYSLOG((LOG_ERR, "PID %d: Error sending data to connection n:o: %d\n", 
+        SYSLOG((LOG_ERR, "PID %d: Error sending data to connection n:o: %d\n",
                getpid(), i + 1));
         free(data);
         exit(1);
       }
-      
+
       if (!flood) {
         if (e_sleep * 1000 < 1000000)
           usleep(e_sleep * 1000);
@@ -905,12 +966,12 @@ void thread_data_send(struct sockets *s, int offset, int num,
   /* close the connections */
   for (i = offset; i < num + offset; i++)
     if ((close_connection(s->sockets[i])) < 0) {
-      SYSLOG((LOG_ERR, "PID %d: Error closing connection n:o: %d\n", 
+      SYSLOG((LOG_ERR, "PID %d: Error closing connection n:o: %d\n",
              getpid(), i + 1));
       free(data);
       exit(1);
     }
-  
+
   free(data);
   exit(0);
 }
