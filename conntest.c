@@ -50,7 +50,7 @@ int e_num_conn;
 int e_data_len;
 int e_send_loop;
 int e_flood, e_data_flood;
-int e_sleep = 1;
+int e_sleep = 1000;
 int e_threads;
 int e_proto;
 int e_do_ike = 0;
@@ -188,17 +188,17 @@ int send_data(int sock, struct sockaddr_in *udp, void *data, unsigned int len)
 
 void usage() 
 {
-  printf("Usage: conntest [-hVhpcdltfF]\n");
+  printf("Usage: conntest [-hVhpcdltnfF]\n");
   printf("Options:\n");
   printf("  -h <hostname>   destination host name (default: localhost)\n");
   printf("  -H <IP-IP>      IP range (eg. 10.2.1.1-10.2.1.254)\n");
   printf("  -p <port>       destination port (default: 9 (discard))\n");
-  printf("  -P <protocol>   protocol (default: tcp)\n");
-  printf("  -c <number>     number of connections (default: 10)\n");
+  printf("  -P <protocol>   protocol, tcp or udp (default: tcp)\n");
+  printf("  -c <number>     number of connections (default: 1)\n");
   printf("  -d <length>     length of data to transmit (default: 1024)\n");
   printf("  -l <number>     number of loops to send data (default: infinity)\n");
   printf("  -t <number>     number of threads used in data sending (default: single)\n");
-  printf("  -n <secs>       data send interval (ignored with -F) (default: 1 second)\n");
+  printf("  -n <msec>       data send interval (ignored with -F) (default: 1000 msec)\n");
   printf("  -f              flood, no delays creating connections (default: undefined)\n");
   printf("  -F              flood, no delays between data sends (default: undefined)\n");
   printf("  -V              display version and help\n");
@@ -263,7 +263,7 @@ int main(int argc, char **argv)
     while((opt = getopt(argc, argv, "Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:")) != EOF) {
       switch(opt) {
       case 'V':
-        fprintf(stderr, "ConnTest, version 1.7 (c) 1999, 2001, 2002 Pekka Riikonen\n");
+        fprintf(stderr, "ConnTest, version 1.9 (c) 1999, 2001, 2002, 2006 Pekka Riikonen\n");
         usage();
         break;
       case 'h':
@@ -428,13 +428,13 @@ int main(int argc, char **argv)
 	fprintf(stderr, "#%3d: ", i + 1);
       retry0:
 	if (create_connection(e_port, ip, count, &s) < 0) {
-	  fprintf(stderr, "Retrying after 60 seconds\n");
-	  sleep(60);
+	  fprintf(stderr, "Retrying after 30 seconds\n");
+	  sleep(30);
 	  goto retry0;
 	}
 	
 	if (!e_flood)
-	  usleep(50000);
+	 usleep(50000);
 	count++;
       }
     }
@@ -445,8 +445,8 @@ int main(int argc, char **argv)
       fprintf(stderr, "#%3d: ", i + 1);
     retry:
       if (create_connection(e_port, e_host, i, &s) < 0) {
-	fprintf(stderr, "Retrying after 60 seconds\n");
-	sleep(60);
+	fprintf(stderr, "Retrying after 30 seconds\n");
+	sleep(30);
 	goto retry;
       }
       
@@ -484,8 +484,12 @@ int main(int argc, char **argv)
           exit(1);
         }
         
-        if (!e_data_flood)
-          sleep(e_sleep);
+        if (!e_data_flood) {
+	  if (e_sleep * 1000 < 1000000)
+            usleep(e_sleep * 1000);
+	  else
+	    sleep(e_sleep / 1000);
+	}
       }
       if (k >= 0)
         k++;
@@ -531,8 +535,12 @@ int main(int argc, char **argv)
           exit(1);
         }
         
-        if (!e_data_flood)
-          sleep(e_sleep);
+        if (!e_data_flood) {
+	  if (e_sleep * 1000 < 1000000)
+            usleep(e_sleep * 1000);
+	  else
+	    sleep(e_sleep / 1000);
+	}
       }
       if (k >= 0)
         k++;
@@ -586,8 +594,12 @@ void thread_data_send(struct sockets *s, int offset, int num,
         exit(1);
       }
       
-      if (!flood)
-        sleep(e_sleep);
+      if (!flood) {
+        if (e_sleep * 1000 < 1000000)
+          usleep(e_sleep * 1000);
+	else
+	  sleep(e_sleep / 1000);
+      }
     }
     if (k >= 0)
       k++;
