@@ -2,7 +2,7 @@
 
   conntest.c
 
-  Copyright (c) 1999 - 2009 Pekka Riikonen, priikone@iki.fi.
+  Copyright (c) 1999 - 2010 Pekka Riikonen, priikone@iki.fi.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -42,6 +42,7 @@
 #include <syslog.h>
 #endif
 
+#include "conntest.h"
 #include "ike.h"
 
 char *e_host = NULL;
@@ -75,6 +76,7 @@ int e_random_ip = 0;
 int e_pmtu = -1;
 int e_ttl = -1;
 int e_time;
+int e_want_ip6 = 0;
 unsigned int e_quiet = 0;
 
 #define MAX_SOCKETS 20000
@@ -84,7 +86,7 @@ static unsigned char ip4_header[20] = "\x45\x00\x00\x00\x00\x00\x00\x00\xff\x00\
 struct sockets {
   int sockets[MAX_SOCKETS];
   unsigned char ip4h[MAX_SOCKETS][20];
-  struct sockaddr_in udp_dest[MAX_SOCKETS];
+  c_sockaddr udp_dest[MAX_SOCKETS];
   int num_sockets;
 };
 
@@ -102,8 +104,147 @@ do {									\
    (((unsigned int)(l) & (unsigned int)0x00FF0000UL) >> 8)  |		\
    (((unsigned int)(l) & (unsigned int)0xFF000000UL) >> 24))
 
+#define SIZEOF_SOCKADDR(so) ((so).sa.sa_family == AF_INET6 ?    \
+  sizeof((so).sin6) : sizeof((so).sin))
+
 void thread_data_send(struct sockets *s, int offset, int num,
                       int loop, void *data, int datalen, int flood);
+
+int is_ip6(const char *addr)
+{
+  /* XXX does this work with all kinds of IPv6 addresses? */
+  while (*addr && *addr != '%') {
+    if (*addr != ':' && !isxdigit((int)*addr))
+      return 0;
+    addr++;
+  }
+
+  return 1;
+}
+
+int c_gethostbyname(char *name, int want_ipv6, char *addr, int addr_size)
+{
+  struct addrinfo hints, *ai, *tmp, *ip4 = NULL, *ip6 = NULL;
+
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo(name, NULL, &hints, &ai))
+    return 0;
+
+  for (tmp = ai; tmp; tmp = tmp->ai_next) {
+    if (tmp->ai_family == AF_INET6) {
+      ip6 = tmp;
+      if (ip4)
+        break;
+      continue;
+    }
+    if (tmp->ai_family == AF_INET) {
+      ip4 = tmp;
+      if (ip6)
+        break;
+      continue;
+    }
+  }
+
+  tmp = (want_ipv6 ? (ip6 ? ip6 : ip4) : (ip4 ? ip4 : ip6));
+  if (!tmp) {
+    freeaddrinfo(ai);
+    return 0;
+  }
+
+  if (getnameinfo(tmp->ai_addr, tmp->ai_addrlen, addr,
+                  addr_size, NULL, 0, NI_NUMERICHOST)) {
+    freeaddrinfo(ai);
+    return 0;
+  }
+
+  freeaddrinfo(ai);
+  return 1;
+}
+
+int addr2bin(const char *addr, void *bin, size_t bin_len, int *dev)
+{
+  int ret = 0;
+
+  if (!is_ip6(addr)) {
+    /* IPv4 address */
+    struct in_addr tmp;
+
+    ret = inet_aton(addr, &tmp);
+    if (!ret)
+      return 0;
+
+    memcpy(bin, (unsigned char *)&tmp.s_addr, 4);
+    *dev = 0;
+  } else {
+    struct addrinfo hints, *ai;
+    c_sockaddr *s;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET6;
+    if (getaddrinfo(addr, NULL, &hints, &ai))
+      return 0;
+
+    if (ai) {
+      s = (c_sockaddr *)ai->ai_addr;
+      memcpy(bin, &s->sin6.sin6_addr, sizeof(s->sin6.sin6_addr));
+      *dev = s->sin6.sin6_scope_id;
+      freeaddrinfo(ai);
+    }
+
+    ret = 1;
+  }
+
+  return ret != 0;
+}
+
+int set_sockaddr(c_sockaddr *addr, const char *ip_addr, int port, int *family,
+		 unsigned char *iphdr, int local)
+{
+  int len, dev;
+
+  memset(addr, 0, sizeof(*addr));
+
+  /* Check for IPv4 and IPv6 addresses */
+  if (ip_addr) {
+    if (!is_ip6(ip_addr)) {
+      /* IPv4 address */
+      len = sizeof(addr->sin.sin_addr);
+      if (!addr2bin(ip_addr,
+                    (unsigned char *)&addr->sin.sin_addr.s_addr, len, &dev))
+        return 0;
+      addr->sin.sin_family = AF_INET;
+      addr->sin.sin_port = port ? htons(port) : 0;
+      *family = AF_INET;
+
+      /* Update raw IP header */
+      local = local ? 12 : 16;
+      memcpy(iphdr + local, &addr->sin.sin_addr.s_addr, 4);
+    } else {
+      /* IPv6 address */
+      len = sizeof(addr->sin6.sin6_addr);
+      if (!addr2bin(ip_addr,
+                    (unsigned char *)&addr->sin6.sin6_addr, len, &dev))
+        return 0;
+      addr->sin6.sin6_family = AF_INET6;
+      addr->sin6.sin6_port = port ? htons(port) : 0;
+      addr->sin6.sin6_scope_id = dev; 
+     *family = AF_INET6;
+
+      /* Update raw IP header */
+      /* XXX TODO */
+    }
+  } else {
+    /* Any address */
+    addr->sin.sin_family = *family;
+    addr->sin.sin_addr.s_addr = INADDR_ANY;
+    if (port)
+      addr->sin.sin_port = htons(port);
+  }
+
+  return 1;
+}
+
 
 /* Convert HEX string to binary data */
 
@@ -153,12 +294,14 @@ int create_connection(int port, char *dhost, int index,
 		      struct sockets *sockets)
 {
   int i, sock;
-  struct hostent *hp;
-  struct sockaddr_in desthost, srchost;
+  c_sockaddr desthost, srchost;
+  char a[64];
 #ifdef WIN32
   unsigned long addr;
 #endif
   unsigned char *ip4h = sockets->ip4h[index];
+
+  memset(a, 0, sizeof(a));
 
   memcpy(ip4h, ip4_header, 20);
 
@@ -167,25 +310,25 @@ int create_connection(int port, char *dhost, int index,
   if (e_sock_proto == IPPROTO_RAW)
     memcpy(ip4h, e_header, e_header_len < 20 ? e_header_len : 20);
 
-  /* do host look up */
-  memset(&desthost, 0, sizeof(desthost));
-  desthost.sin_port = htons(port);
-  desthost.sin_family = e_sock_type;
+  /* Do host look up */
   if (dhost) {
 #ifndef WIN32
-    hp = gethostbyname(dhost);
-    if (!hp) {
+    if (!c_gethostbyname(dhost, e_want_ip6, a, sizeof(a))) {
       fprintf(stderr, "Network (%s) is unreachable\n", dhost);
       return -1;
     }
-    /* set socket infos */
-    memcpy(&desthost.sin_addr, hp->h_addr_list[0], sizeof(desthost.sin_addr));
-    memcpy(ip4h + 16, hp->h_addr_list[0], 4);
+    if (!set_sockaddr(&desthost, a, port, &e_sock_type, ip4h, 0)) {
+      fprintf(stderr, "Error setting socket address: %s\n", strerror(errno));
+      return -1;
+    }
 #else
     addr = inet_addr(dhost);
     memcpy(&desthost.sin_addr, &addr, sizeof(desthost.sin_addr));
     PUT32(ip4h + 16, addr);
 #endif
+  } else {
+    /* Any address */
+    set_sockaddr(&desthost, NULL, port, &e_sock_type, NULL, 0);
   }
 
   /* create the connection socket */
@@ -207,18 +350,19 @@ int create_connection(int port, char *dhost, int index,
 
   /* Bind to local IP and port */
   if (e_lip || e_lport) {
-    memset(&srchost, 0, sizeof(srchost));
-    srchost.sin_family = e_sock_type;
-    srchost.sin_port = htons(e_lport);
 #ifndef WIN32
     if (e_lip) {
-      hp = gethostbyname(e_lip);
-      if (!hp) {
+      if (!c_gethostbyname(e_lip, e_want_ip6, a, sizeof(a))) {
         fprintf(stderr, "Network (%s) is unreachable\n", e_lip);
         return -1;
       }
-      memcpy(&srchost.sin_addr, hp->h_addr_list[0], sizeof(srchost.sin_addr));
-      memcpy(ip4h + 12, hp->h_addr_list[0], 4);
+      if (!set_sockaddr(&srchost, a, e_lport, &e_sock_type, ip4h, 1)) {
+        fprintf(stderr, "Error setting socket address: %s\n", strerror(errno));
+        return -1;
+      }
+    } else {
+      /* Any address */
+      set_sockaddr(&srchost, NULL, e_lport, &e_sock_type, NULL, 0);
     }
 #else
     if (e_lip) {
@@ -256,12 +400,11 @@ int create_connection(int port, char *dhost, int index,
   if (e_proto == SOCK_STREAM) {
     if (!e_quiet)
       fprintf(stderr, "Connecting to port %d of host %s (%s).", port,
-	      dhost ? dhost : "N/A",
-	      dhost ? inet_ntoa(desthost.sin_addr) : "N/A");
+	      dhost ? dhost : "N/A", dhost ? a : "N/A");
 
-    i = connect(sock, (struct sockaddr *)&desthost, sizeof(desthost));
+    i = connect(sock, &desthost.sa, SIZEOF_SOCKADDR(desthost));
     if (i < 0) {
-      fprintf(stderr, "connect(): %s\n", strerror(errno));
+      fprintf(stderr, "\nconnect(): %s\n", strerror(errno));
       shutdown(sock, 2);
       close(sock);
     } else {
@@ -283,8 +426,7 @@ int create_connection(int port, char *dhost, int index,
   } else {
     if (!e_quiet)
       fprintf(stderr, "Sending data to port %d of host %s (%s).\n", port,
-	      dhost ? dhost : "N/A",
-	      dhost ? inet_ntoa(desthost.sin_addr) : "N/A");
+	      dhost ? dhost : "N/A", dhost ? a : "N/A");
     sockets->sockets[index] = sock;
     memcpy(&sockets->udp_dest[index], &desthost, sizeof(desthost));
     set_sockopt(sock, SOL_SOCKET, SO_BROADCAST, 1);
@@ -319,7 +461,7 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
   int ret, i;
   int sock = s->sockets[index];
   unsigned char *ip4h = s->ip4h[index];
-  struct sockaddr_in *udp = &s->udp_dest[index];
+  c_sockaddr *udp = &s->udp_dest[index];
   unsigned char *d = data;
 
   /* If requested, make data unique */
@@ -358,7 +500,7 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
       return -1;
     }
   } else {
-    ret = sendto(sock, data, len, 0, (struct sockaddr *)udp, sizeof(*udp));
+    ret = sendto(sock, data, len, 0, &udp->sa, SIZEOF_SOCKADDR(*udp));
     if (ret < 0) {
       fprintf(stderr, "sendto(): %s\n", strerror(errno));
       fprintf(stderr, "%x.%x.%x.%x\n", ip4h[12], ip4h[13], ip4h[14], ip4h[15]);
@@ -394,6 +536,7 @@ void usage()
   printf("  -f              Flood, no delays creating connections (default: undefined)\n");
   printf("  -F              Flood, no delays between data sends (default: undefined)\n");
   printf("  -q              Quiet, don't display anything\n");
+  printf("  -6              Use/prefer IPv6 addresses\n");
   printf("  -V              Display version and help, then exit\n");
   printf("\n  Protocols:\n");
   printf("  -A <protocol>   Do <protocol> attack\n");
@@ -408,6 +551,8 @@ void usage()
   printf("      conntest -h 10.2.1.7 -P udp -p 1234\n");
   printf("  - Open TCP connection to 10.2.1.7 on port 80 and send HTTP request:\n");
   printf("      conntest -h 10.2.1.7 -P tcp -p 80 -D \"GET / HTTP 1.1\"\n");
+  printf("  - Open TCP connection to fe80::250:56ff:fec0:8 via eth1\n");
+  printf("      conntest -h fe80::250:56ff:fec0:8%%eth1 -P tcp -p 80\n");
   printf("  - Send bogus TCP packets to 10.2.1.7 from random IP (no TCP handshake):\n");
   printf("      conntest -h 10.2.1.7 -r -P 6\n");
   printf("  - Send random 300 byte ESP packets to host 10.2.1.7 from IP 1.1.1.1:\n");
@@ -475,13 +620,17 @@ int main(int argc, char **argv)
   if (argc > 1) {
     k = 1;
     while((opt = getopt(argc, argv,
-			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:D:Q:L:K:uR:m:T:rq"))
+			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:D:Q:L:K:uR:m:T:rq6"))
 	  != EOF) {
       switch(opt) {
       case 'V':
         fprintf(stderr,
-		"ConnTest, version 1.12 (c) 1999 - 2009 Pekka Riikonen\n");
+		"ConnTest, version 1.13 (c) 1999 - 2010 Pekka Riikonen\n");
         usage();
+        break;
+      case '6':
+	e_want_ip6 = 1;
+	k++;
         break;
       case 'q':
 	e_quiet = 1;

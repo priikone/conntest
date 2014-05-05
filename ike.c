@@ -2,7 +2,7 @@
 
   ike.c 
 
-  Copyright (c) 2001, 2008 Pekka Riikonen, priikone@silcnet.org.
+  Copyright (c) 2001 - 2010 Pekka Riikonen, priikone@silcnet.org.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -483,7 +483,7 @@ void *ike_start(void)
    Each negotiation is run in own process. Each negotiation will end on
    its own after negotiation is finished. */
 
-void ike_add(void *context, int sock, struct sockaddr_in *dest,
+void ike_add(void *context, int sock, c_sockaddr *dest,
 	     int flood, char *identity, int group, int auth, int attack)
 {
   Ike ike = (Ike)context;
@@ -501,7 +501,7 @@ void ike_add(void *context, int sock, struct sockaddr_in *dest,
   neg->identity = identity ? strdup(identity) : strdup("0.0.0.0");
   neg->group = group;
   neg->auth = auth;
-  memcpy(&neg->dest, dest, sizeof(*dest));
+  memcpy(&neg->dest, &dest->sin, sizeof(dest->sin));
 
   ike->neg[ike->num_neg] = neg;
   ike->num_neg++;
