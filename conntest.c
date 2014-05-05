@@ -46,8 +46,8 @@
 #include "conntest.h"
 #include "ike.h"
 
-/* Ethernet header len without packet payload */
-#define ETHLEN (1 + 7 + 6 + 6 + 2 + 4)
+/* Ethernet header len */
+#define ETHLEN 14
 
 /* IPv4 header len */
 #define IP4LEN 20
@@ -159,7 +159,7 @@ static inline
 unsigned long long rdtsc(void)
 {
 #if defined(__GNUC__) || defined(__ICC)
-#if defined(__i486__)
+#if defined(__i386__) || defined(__i486__) || defined(__i586__) || defined(__i686__) || defined(__i786__)
   unsigned long long x;
   asm volatile ("rdtsc" : "=A" (x));
   return x;
@@ -193,6 +193,19 @@ unsigned long long rdtsc(void)
 #else
   return 0;
 #endif /* __GNUC__ || __ICC */
+}
+
+static inline void bsleep(unsigned int t)
+{
+  unsigned long long end = rdtsc();
+
+  if (!end) {
+    usleep(t);
+    return;
+  }
+
+  end = rdtsc() + ((unsigned long long)t * (e_freq / 1000));
+  while (rdtsc() < end) ;
 }
 
 void hexdump(const unsigned char *data, size_t data_len,
@@ -520,9 +533,13 @@ int create_connection(int port, char *dhost, int index,
 #ifndef WIN32
   if (e_pmtu != -1) {
     if (e_want_ip6) {
+#ifdef IPV6_MTU_DISCOVER
       set_sockopt(sock, IPPROTO_IPV6, IPV6_MTU_DISCOVER, e_pmtu);
+#endif /* IPV6_MTU_DISCOVER */
     } else {
+#ifdef IP_MTU_DISCOVER
       set_sockopt(sock, IPPROTO_IP, IP_MTU_DISCOVER, e_pmtu);
+#endif /* IP_MTU_DISCOVER */
       if (e_proto == SOCK_RAW && e_pmtu == 3)
         iph[6] = 0x40;
     }
@@ -800,6 +817,8 @@ static inline int speed_adjust(int speed, int len, unsigned long long c,
   if (tmp < 0.99f || tmp > 1.01f) {
     tmp = (double)speed * tmp;
     speed = tmp + 0.5f;
+    if (speed < 1)
+      speed = 1;
   }
 
   return speed;
@@ -814,6 +833,10 @@ static int speed_per_usec(int data_len)
     return -1;
 
   v = rdtsc();
+  if (!v) {
+    fprintf(stderr, "conntest: rdtsc not available on this platform, -s option is ignored\n");
+    return -1;
+  }
   usleep(100000);
   v = rdtsc() - v;
   v *= 10;
@@ -906,7 +929,7 @@ int main(int argc, char **argv)
       switch(opt) {
       case 'V':
         fprintf(stderr,
-		"ConnTest, version 1.21 (c) 1999 - 2011 Pekka Riikonen\n");
+		"ConnTest, version 1.22 (c) 1999 - 2011 Pekka Riikonen\n");
         usage();
         break;
       case '6':
@@ -1077,8 +1100,10 @@ int main(int argc, char **argv)
 	    GET_SEPARATED(argv[k], 'G', sp, stmp);
 	    e_speed = atoi(sp);
 	    e_speed_unit = GIBIT;
-	  } else
+	  } else {
+	    fprintf(stderr, "conntest: unsupported rate/sec unit\n");
 	    usage();
+	  }
 	  free(sp);
 	  free(stmp);
           k++;
@@ -1382,7 +1407,7 @@ int main(int argc, char **argv)
         if (!e_data_flood) {
 	  if (speed != -1) {
             if (--cpkts == 0) {
-	      usleep(speed);
+	      bsleep(speed);
 	      cpkts = e_num_pkts;
 	    }
 
@@ -1456,7 +1481,7 @@ int main(int argc, char **argv)
         if (!e_data_flood) {
 	  if (speed != -1) {
             if (--cpkts == 0) {
-	      usleep(speed);
+	      bsleep(speed);
 	      cpkts = e_num_pkts;
 	    }
 
@@ -1538,7 +1563,7 @@ void thread_data_send(struct sockets *s, int offset, int num,
       if (!flood) {
 	if (e_speed != -1) {
           if (--cpkts == 0) {
-	    usleep(speed);
+	    bsleep(speed);
 	    cpkts = e_num_pkts;
 	  }
 
