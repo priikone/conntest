@@ -24,10 +24,14 @@
 /* Starts IKE server and returns a context to the server. */
 void *ike_start(void);
 
+#define IKE_ATTACK_AGGR 1
+#define IKE_ATTACK_MM 2
+
 /* Adds new IKE negotiation to the IKE server and starts the negotiation.
    Each negotiation is run in own process. Each negotiation will end on
    its own after negotiation is finished. */
 void ike_add(void *context, int sock, struct sockaddr_in *dest,
-	     int flood, char *identity, int group, int auth);
+	     int flood, char *identity, int group, int auth,
+	     int attack);
 
 #endif /* IKE_H */
