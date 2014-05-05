@@ -34,11 +34,12 @@
 #else
 #define SYSLOG(x) syslog x
 #include <unistd.h>
-#include <netdb.h>
+#include <sys/uio.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/tcp.h>
 #include <syslog.h>
 #endif
 
@@ -77,7 +78,8 @@ int e_pmtu = -1;
 int e_ttl = -1;
 int e_time;
 int e_want_ip6 = 0;
-unsigned int e_quiet = 0;
+int e_quiet = 0;
+int e_hexdump = 0;
 
 #define MAX_SOCKETS 20000
 
@@ -85,17 +87,24 @@ static unsigned char ip4_header[20] = "\x45\x00\x00\x00\x00\x00\x00\x00\xff\x00\
 
 struct sockets {
   int sockets[MAX_SOCKETS];
-  unsigned char ip4h[MAX_SOCKETS][20];
+  unsigned char iph[MAX_SOCKETS][20];
   c_sockaddr udp_dest[MAX_SOCKETS];
+  c_sockaddr udp_src[MAX_SOCKETS];
   int num_sockets;
 };
 
 #define PUT32(d, n)							\
 do {									\
-  (d)[0] = n >> 24 & 0xff;						\
-  (d)[1] = n >> 16 & 0xff;						\
-  (d)[2] = n >> 8 & 0xff;						\
-  (d)[3] = n & 0xff;							\
+  (d)[0] = (n) >> 24 & 0xff;						\
+  (d)[1] = (n) >> 16 & 0xff;						\
+  (d)[2] = (n) >> 8 & 0xff;						\
+  (d)[3] = (n) & 0xff;							\
+} while(0)
+
+#define PUT16(d, n)							\
+do {									\
+  (d)[0] = (n) >> 8 & 0xff;						\
+  (d)[1] = (n) & 0xff;							\
 } while(0)
 
 #define SWAB32(l) ((unsigned int)					\
@@ -107,12 +116,74 @@ do {									\
 #define SIZEOF_SOCKADDR(so) ((so).sa.sa_family == AF_INET6 ?    \
   sizeof((so).sin6) : sizeof((so).sin))
 
+void hexdump(const unsigned char *data, size_t data_len,
+             FILE *output)
+{
+  int i, k;
+  int off, pos, count;
+  int len = data_len;
+
+  k = 0;
+  pos = 0;
+  count = 16;
+  off = len % 16;
+  while (1) {
+    if (off) {
+      if ((len - pos) < 16 && (len - pos <= len - off))
+        count = off;
+    } else {
+      if (pos == len)
+        count = 0;
+    }
+    if (off == len)
+      count = len;
+
+    if (count)
+      fprintf(output, "%08X  ", k++ * 16);
+
+    for (i = 0; i < count; i++) {
+      fprintf(output, "%02X ", data[pos + i]);
+
+      if ((i + 1) % 4 == 0)
+        fprintf(output, " ");
+    }
+
+    if (count && count < 16) {
+      int j;
+
+      for (j = 0; j < 16 - count; j++) {
+        fprintf(output, "   ");
+
+        if ((j + count + 1) % 4 == 0)
+          fprintf(output, " ");
+      }
+    }
+
+    for (i = 0; i < count; i++) {
+      char ch;
+
+      if (data[pos] < 32 || data[pos] >= 127)
+        ch = '.';
+      else
+        ch = data[pos];
+
+      fprintf(output, "%c", ch);
+      pos++;
+    }
+
+    if (count)
+      fprintf(output, "\n");
+
+    if (count < 16)
+      break;
+  }
+}
+
 void thread_data_send(struct sockets *s, int offset, int num,
                       int loop, void *data, int datalen, int flood);
 
 int is_ip6(const char *addr)
 {
-  /* XXX does this work with all kinds of IPv6 addresses? */
   while (*addr && *addr != '%') {
     if (*addr != ':' && !isxdigit((int)*addr))
       return 0;
@@ -227,12 +298,10 @@ int set_sockaddr(c_sockaddr *addr, const char *ip_addr, int port, int *family,
                     (unsigned char *)&addr->sin6.sin6_addr, len, &dev))
         return 0;
       addr->sin6.sin6_family = AF_INET6;
-      addr->sin6.sin6_port = port ? htons(port) : 0;
+      if (e_proto != SOCK_RAW)
+        addr->sin6.sin6_port = port ? htons(port) : 0;
       addr->sin6.sin6_scope_id = dev; 
-     *family = AF_INET6;
-
-      /* Update raw IP header */
-      /* XXX TODO */
+      *family = AF_INET6;
     }
   } else {
     /* Any address */
@@ -244,7 +313,6 @@ int set_sockaddr(c_sockaddr *addr, const char *ip_addr, int port, int *family,
 
   return 1;
 }
-
 
 /* Convert HEX string to binary data */
 
@@ -281,7 +349,8 @@ int set_sockopt(int socket, int t, int s, int val)
                  (void *) &option,
                  sizeof(int)) < 0)
     {
-      fprintf(stderr, "setsockopt(): %s\n", strerror(errno));
+      fprintf(stderr, "setsockopt(): %s (%d %d %d) \n", strerror(errno),
+	      t, s, val);
       return -1;
     }
   return 0;
@@ -295,36 +364,40 @@ int create_connection(int port, char *dhost, int index,
 {
   int i, sock;
   c_sockaddr desthost, srchost;
-  char a[64];
+  char src[64], dst[64];
 #ifdef WIN32
   unsigned long addr;
 #endif
-  unsigned char *ip4h = sockets->ip4h[index];
+  unsigned char *iph = sockets->iph[index];
 
-  memset(a, 0, sizeof(a));
+  memset(src, 0, sizeof(src));
+  memset(dst, 0, sizeof(dst));
 
-  memcpy(ip4h, ip4_header, 20);
+  if (!e_want_ip6)
+    memcpy(iph, ip4_header, 20);
 
   /* If raw protocol was given the caller must provide the IP header (or
      part of it). */
-  if (e_sock_proto == IPPROTO_RAW)
-    memcpy(ip4h, e_header, e_header_len < 20 ? e_header_len : 20);
+  if (e_sock_proto == IPPROTO_RAW && !e_want_ip6)
+    memcpy(iph, e_header, e_header_len < 20 ? e_header_len : 20);
 
   /* Do host look up */
   if (dhost) {
 #ifndef WIN32
-    if (!c_gethostbyname(dhost, e_want_ip6, a, sizeof(a))) {
+    if (!c_gethostbyname(dhost, e_want_ip6, dst, sizeof(dst))) {
       fprintf(stderr, "Network (%s) is unreachable\n", dhost);
       return -1;
     }
-    if (!set_sockaddr(&desthost, a, port, &e_sock_type, ip4h, 0)) {
+    if (!set_sockaddr(&desthost, dst, port, &e_sock_type, iph, 0)) {
       fprintf(stderr, "Error setting socket address: %s\n", strerror(errno));
       return -1;
     }
+    if (is_ip6(dst))
+      e_want_ip6 = 1;
 #else
     addr = inet_addr(dhost);
     memcpy(&desthost.sin_addr, &addr, sizeof(desthost.sin_addr));
-    PUT32(ip4h + 16, addr);
+    PUT32(iph + 16, addr);
 #endif
   } else {
     /* Any address */
@@ -342,21 +415,22 @@ int create_connection(int port, char *dhost, int index,
      IP_HRDINCL sockopt so we can specify our own IP. */
   if (e_proto == SOCK_RAW && (e_lip || e_sock_proto == IPPROTO_RAW)) {
 #ifndef WIN32
-    set_sockopt(sock, IPPROTO_IP, IP_HDRINCL, 1);
+    if (!e_want_ip6)
+      set_sockopt(sock, IPPROTO_IP, IP_HDRINCL, 1);
 #endif
-    if (e_sock_proto != IPPROTO_RAW)
-      ip4h[9] = e_sock_proto;
+    if (e_sock_proto != IPPROTO_RAW && !e_want_ip6)
+      iph[9] = e_sock_proto;
   }
 
   /* Bind to local IP and port */
   if (e_lip || e_lport) {
 #ifndef WIN32
     if (e_lip) {
-      if (!c_gethostbyname(e_lip, e_want_ip6, a, sizeof(a))) {
+      if (!c_gethostbyname(e_lip, e_want_ip6, src, sizeof(src))) {
         fprintf(stderr, "Network (%s) is unreachable\n", e_lip);
         return -1;
       }
-      if (!set_sockaddr(&srchost, a, e_lport, &e_sock_type, ip4h, 1)) {
+      if (!set_sockaddr(&srchost, src, e_lport, &e_sock_type, iph, 1)) {
         fprintf(stderr, "Error setting socket address: %s\n", strerror(errno));
         return -1;
       }
@@ -368,7 +442,7 @@ int create_connection(int port, char *dhost, int index,
     if (e_lip) {
       addr = inet_addr(e_lip);
       memcpy(&srchost.sin_addr, &addr, sizeof(srchost.sin_addr));
-      PUT32(ip4h + 12, addr);
+      PUT32(iph + 12, addr);
     }
 #endif
     if (e_proto != SOCK_RAW) {
@@ -382,17 +456,21 @@ int create_connection(int port, char *dhost, int index,
   /* Set PMTU discovery policy */
 #ifndef WIN32
   if (e_pmtu != -1) {
-    set_sockopt(sock, SOL_IP, IP_MTU_DISCOVER, e_pmtu);
-    if (e_proto == SOCK_RAW && e_pmtu == 3)
-      ip4h[6] = 0x40;
+    if (e_want_ip6) {
+      set_sockopt(sock, IPPROTO_IPV6, IPV6_MTU_DISCOVER, e_pmtu);
+    } else {
+      set_sockopt(sock, IPPROTO_IP, IP_MTU_DISCOVER, e_pmtu);
+      if (e_proto == SOCK_RAW && e_pmtu == 3)
+        iph[6] = 0x40;
+    }
   }
 
   /* Set TTL */
   if (e_ttl != -1) {
     if (e_ttl)
-      set_sockopt(sock, SOL_IP, IP_TTL, e_ttl);
-    if (e_proto == SOCK_RAW)
-      ip4h[8] = e_ttl;
+      set_sockopt(sock, IPPROTO_IP, IP_TTL, e_ttl);
+    if (e_proto == SOCK_RAW && !e_want_ip6)
+      iph[8] = e_ttl;
   }
 #endif
 
@@ -400,7 +478,7 @@ int create_connection(int port, char *dhost, int index,
   if (e_proto == SOCK_STREAM) {
     if (!e_quiet)
       fprintf(stderr, "Connecting to port %d of host %s (%s).", port,
-	      dhost ? dhost : "N/A", dhost ? a : "N/A");
+	      dhost ? dhost : "N/A", dhost ? dst : "N/A");
 
     i = connect(sock, &desthost.sa, SIZEOF_SOCKADDR(desthost));
     if (i < 0) {
@@ -426,9 +504,10 @@ int create_connection(int port, char *dhost, int index,
   } else {
     if (!e_quiet)
       fprintf(stderr, "Sending data to port %d of host %s (%s).\n", port,
-	      dhost ? dhost : "N/A", dhost ? a : "N/A");
+	      dhost ? dhost : "N/A", dhost ? dst : "N/A");
     sockets->sockets[index] = sock;
     memcpy(&sockets->udp_dest[index], &desthost, sizeof(desthost));
+    memcpy(&sockets->udp_src[index], &srchost, sizeof(srchost));
     set_sockopt(sock, SOL_SOCKET, SO_BROADCAST, 1);
 #if defined(SO_SNDBUF)
     if (set_sockopt(sock, SOL_SOCKET, SO_SNDBUF, 1000000) < 0)
@@ -460,37 +539,75 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
 {
   int ret, i;
   int sock = s->sockets[index];
-  unsigned char *ip4h = s->ip4h[index];
+  unsigned char *iph = s->iph[index];
   c_sockaddr *udp = &s->udp_dest[index];
-  unsigned char *d = data;
+  c_sockaddr *src = &s->udp_src[index];
+  unsigned char *d = data, tmp[40];
+  struct msghdr msg;
+  struct cmsghdr *cm;
+  struct in6_pktinfo *pkt;
+  struct iovec iov;
 
   /* If requested, make data unique */
   if (e_unique)
     for (i = e_header_len; i < (len - e_header_len) - 1; i++)
       d[i] ^= d[i + 1] ^ ((d[i] + 0x9d2c5681UL) * 1812433253UL) >> 11;
 
-  /* If raw sockets and local IP is specified, now copy the IP header */
-  if (e_proto == SOCK_RAW && (e_lip || e_sock_proto == IPPROTO_RAW))
-    memcpy(d, ip4h, 20);
+  if (e_want_ip6) {
+    /* IPv6 */
 
-  /* Randomize source IP if requested */
-  if (e_random_ip) {
-    ip4h[12] = d[12] ^= (e_time ^ (e_time >> 11));
-    ip4h[13] = d[13] ^= d[12] ^ ((d[13] << 7) & 0x9d2c5680UL);
-    ip4h[14] = d[14] ^= d[13] ^ ((d[14] << 15) & 0xefc60000UL);
-    ip4h[15] = d[15] ^= d[14] ^ (d[15] >> 18);
-    if (d[12] == 0 || d[12] == 224 || d[12] == 255)
-      ip4h[12] = d[12] = 1;
-    if (d[15] == 255)
-      ip4h[15] = d[15] = 1;
-    e_time += 2749;
+    /* For raw sockets set up msghdr and use sendmsg() */
+    if (e_proto == SOCK_RAW) {
+      iov.iov_base = data;
+      iov.iov_len = len;
+
+      memset(&msg, 0, sizeof(msg));
+      msg.msg_name = (void *)&udp->sa;
+      msg.msg_namelen = SIZEOF_SOCKADDR(*udp);
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+
+      msg.msg_control = cm = (struct cmsghdr *)tmp;
+      cm->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+      msg.msg_controllen = cm->cmsg_len;
+      cm->cmsg_level = IPPROTO_IPV6;
+      cm->cmsg_type = IPV6_PKTINFO;
+
+      pkt = (struct in6_pktinfo *)CMSG_DATA(cm);
+      pkt->ipi6_ifindex = src->sin6.sin6_scope_id;
+      memcpy(&pkt->ipi6_addr, &src->sin6.sin6_addr, 16);
+    }
+  } else {
+    /* IPv4 */
+
+    /* If raw sockets and local IP is specified, now copy the IP header */
+    if (e_proto == SOCK_RAW && (e_lip || e_sock_proto == IPPROTO_RAW))
+      memcpy(d, iph, 20);
+
+    /* Randomize source IP if requested */
+    if (e_random_ip) {
+      iph[12] = d[12] ^= (e_time ^ (e_time >> 11));
+      iph[13] = d[13] ^= d[12] ^ ((d[13] << 7) & 0x9d2c5680UL);
+      iph[14] = d[14] ^= d[13] ^ ((d[14] << 15) & 0xefc60000UL);
+      iph[15] = d[15] ^= d[14] ^ (d[15] >> 18);
+      if (d[12] == 0 || d[12] == 224 || d[12] == 255)
+        iph[12] = d[12] = 1;
+      if (d[15] == 255)
+        iph[15] = d[15] = 1;
+      e_time += 2749;
+    }
+
+    /* Source IP range if requested */
+    if (e_lip_start && e_lip_end) {
+      if (e_lip_s > e_lip_e)
+        e_lip_s = atoi(strrchr(e_lip_start, '.') + 1);
+      iph[15] = d[15] = e_lip_s++;
+    }
   }
 
-  /* Source IP range if requested */
-  if (e_lip_start && e_lip_end) {
-    if (e_lip_s > e_lip_e)
-      e_lip_s = atoi(strrchr(e_lip_start, '.') + 1);
-    ip4h[15] = d[15] = e_lip_s++;
+  if (e_hexdump) {
+    fprintf(stdout, "\n");
+    hexdump(data, len, stdout);
   }
 
   if (e_proto == SOCK_STREAM) {
@@ -499,11 +616,16 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
       fprintf(stderr, "send(): %s\n", strerror(errno));
       return -1;
     }
+  } else if (e_proto == SOCK_RAW && e_want_ip6) {
+    ret = sendmsg(sock, &msg, 0);
+    if (ret < 0) {
+      fprintf(stderr, "sendmsg(): %s\n", strerror(errno));
+      return -1;
+    }
   } else {
     ret = sendto(sock, data, len, 0, &udp->sa, SIZEOF_SOCKADDR(*udp));
     if (ret < 0) {
       fprintf(stderr, "sendto(): %s\n", strerror(errno));
-      fprintf(stderr, "%x.%x.%x.%x\n", ip4h[12], ip4h[13], ip4h[14], ip4h[15]);
       return -1;
     }
   }
@@ -519,8 +641,8 @@ void usage()
   printf("  -H <IP-IP>      Destination IP range (eg. 10.2.1.1-10.2.1.254)\n");
   printf("  -p <port>       Destination port\n");
   printf("  -L <IP>         Local IP to use if possible (default: auto)\n");
-  printf("  -R <IP-IP>      Local IP range when -P is 'raw' or integer value\n");
-  printf("  -r              Use random source IP when -P is 'raw' or integer value\n");
+  printf("  -R <IP-IP>      Local IP range when -P is 'raw' or integer value (ipv4)\n");
+  printf("  -r              Use random source IP when -P is 'raw' or integer value (ipv4)\n");
   printf("  -K <port>       Local port to use if possible (default: auto)\n");
   printf("  -P <protocol>   Protocol, 'tcp', 'udp', 'raw' or integer value\n");
   printf("  -c <number>     Number of connections (default: 1)\n");
@@ -537,6 +659,7 @@ void usage()
   printf("  -F              Flood, no delays between data sends (default: undefined)\n");
   printf("  -q              Quiet, don't display anything\n");
   printf("  -6              Use/prefer IPv6 addresses\n");
+  printf("  -x              Hexdump the data to be sent to stdout\n");
   printf("  -V              Display version and help, then exit\n");
   printf("\n  Protocols:\n");
   printf("  -A <protocol>   Do <protocol> attack\n");
@@ -620,16 +743,20 @@ int main(int argc, char **argv)
   if (argc > 1) {
     k = 1;
     while((opt = getopt(argc, argv,
-			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:D:Q:L:K:uR:m:T:rq6"))
+			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:D:Q:L:K:uR:m:T:rq6x"))
 	  != EOF) {
       switch(opt) {
       case 'V':
         fprintf(stderr,
-		"ConnTest, version 1.13 (c) 1999 - 2010 Pekka Riikonen\n");
+		"ConnTest, version 1.14 (c) 1999 - 2010 Pekka Riikonen\n");
         usage();
         break;
       case '6':
 	e_want_ip6 = 1;
+	k++;
+        break;
+      case 'x':
+	e_hexdump = 1;
 	k++;
         break;
       case 'q':
@@ -885,17 +1012,38 @@ int main(int argc, char **argv)
 
   if (e_ip_start && e_ip_end) {
     int start, end, count = 0;
-    start = atoi(strrchr(e_ip_start, '.') + 1);
-    end = atoi(strrchr(e_ip_end, '.') + 1);
+    char *scope = NULL;
+
+    if (is_ip6(e_ip_start))
+      e_want_ip6 = 1;
+
+    if (e_want_ip6) {
+      if (strchr(e_ip_start, '%')) {
+        scope = strdup(strchr(e_ip_start, '%'));
+        *strchr(e_ip_start, '%') = '\0';
+        if (strchr(e_ip_end, '%'))
+          *strchr(e_ip_end, '%') = '\0';
+      }
+      start = strtol(strrchr(e_ip_start, ':') + 1, (char **)NULL, 16);
+      end = strtol(strrchr(e_ip_end, ':') + 1, (char **)NULL, 16);
+    } else {
+      start = atoi(strrchr(e_ip_start, '.') + 1);
+      end = atoi(strrchr(e_ip_end, '.') + 1);
+    }
 
     for (k = start; k <= end; k++) {
       /* create the connections */
-      char tmp[64], ip[64];
+      char tmp[128], ip[128];
 
       memset(ip, 0, sizeof(ip));
       memcpy(tmp, e_ip_start, strlen(e_ip_start));
-      *strrchr(tmp, '.') = '\0';
-      snprintf(ip, sizeof(ip) - 1, "%s.%d", tmp, k);
+      if (e_want_ip6) {
+        *strrchr(tmp, ':') = '\0';
+        snprintf(ip, sizeof(ip) - 1, "%s:%x%s", tmp, k, scope ? scope : "");
+      } else {
+        *strrchr(tmp, '.') = '\0';
+        snprintf(ip, sizeof(ip) - 1, "%s.%d", tmp, k);
+      }
 
       for (i = 0; i < e_num_conn; i++) {
 	if (!e_quiet)
@@ -950,7 +1098,10 @@ int main(int argc, char **argv)
 		"Data length (-d) is shorter than specified header (-D)\n");
         exit(1);
       }
-      memcpy(data + 20, e_header, e_header_len);
+      if (e_want_ip6)
+        memcpy(data, e_header, e_header_len);
+      else
+        memcpy(data + 20, e_header, e_header_len);
     } else {
       if (e_data_len < e_header_len) {
         fprintf(stderr,

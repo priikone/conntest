@@ -1,6 +1,6 @@
 RM=rm -f
 CC=cc
-CFLAGS=-g -Wall
+CFLAGS=-g -Wall -D_GNU_SOURCE
 
 all: conntest
 
