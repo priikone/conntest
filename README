@@ -1,0 +1,112 @@
+Conntest
+========
+
+Conntest is a network tool which can be used to create TCP/IP and UDP/IP
+connections to single or multiple machines at the same time and send the
+desired amount of data at desired speed, and to send arbitrary IP packets.
+
+Conntest also supports IKE (Internet Key Exchange) Aggressive Mode attack,
+which can be used to test the security of IPSEC and IKE  implementations.
+
+Conntest was designed as a tool for implementors of servers, network
+programs and IPSEC implementations. Do not abuse this program!
+
+The program works on Linux, Unix and Windows platforms. It supports both
+IPv4 and IPv6, and client and server modes.
+
+
+Usage
+=====
+
+Usage (client): conntest CLIENT-OPTIONS COMMON-OPTIONS
+Usage (server): conntest -S MODE SERVER-OPTIONS COMMON-OPTIONS
+
+Common options (both client and server mode):
+ -L <IP>          Local IP to use if possible (default: auto)
+ -R <IP-IP>       Local IP range when -P is 'raw' or integer value (ipv4)
+ -K <port>        Local port to use if possible (default: auto)
+ -P <protocol>    Protocol, 'tcp', 'udp', 'raw' or integer value
+ -I <ifname>      Bind to specified interface, eg. eth0
+ -T <ttl>         Set TTL, 0-255, can be used with raw protocols as well
+ -C <dscp-ecn>    Set DSCP and/or ECN (ECN only with -P 'raw' or integer)
+ -f               Flood, no delays creating sockets (default: undefined)
+ -u               Each packet will have unique data payload
+ -q               Quiet, don't display anything
+ -6               Use/prefer IPv6 addresses
+ -4               Force IPv4 (no IPv6 support)
+ -x               Hexdump the data to be sent to stdout
+ -?               Display help and examples, then exit
+ -V               Display version, then exit
+
+Client options:
+ -h <hostname>    Destination IP or host name
+ -H <IP-IP>       Destination IP range (eg. 10.2.1.1-10.2.1.254)
+ -p <num>[-<num>] Destination port, or port range
+ -r               Use random source IP when -P is 'raw' or integer value (ipv4)
+ -b               Use random source port when -P is 'raw' or integer value (ipv4)
+ -t <number>      Number of threads to create (default: 1)
+ -c <number>      Number of connections (default: 1)
+ -d <length>      Length of data to transmit, bytes (default: 1024)
+ -D <string>      Data header to packet, if starts with 0x string must be HEX
+ -Q <file>        Data from file, if -P is 'raw' data must include IP header
+ -O               Diagnostics traffic to test network behavior
+ -l <number>      Number of loops to send data (default: infinity)
+ -n <msec>        Data send interval (ignored with -F) (default: 1000 msec)
+ -s <speed><unit> Rate/sec, Units: SI: kbit, Mbit, Gbit, IEC-27: Kib, Mib, Gib
+ -m <pmtu>        PMTU discovery: 0 no PMTU, 2 do PMTU, 3 set DF, ignore PMTU
+ -B <bitmask>     TCP flags bitmask (8 bits), -P is 6 for TCP (ipv4)
+ -F               Flood, no delays between data sends (default: undefined)
+
+Client protocols:
+ -A <protocol>    Do <protocol> attack
+    ike-aggr      IKE Diffie-Hellman attack with aggressive mode
+    ike-mm        IKE Main Mode double packet attack
+    -i <ip>       Aggressive mode identity (default: 0.0.0.0) (ike-aggr only)
+    -g <group>    IKE group (default: 2)
+    -a <auth>     Auth method (psk, rsa, dss, xauth-psk, xauth-rsa, xauth-dss)
+
+Server options:
+ -S <mode>        Server mode
+    discard       Discard server (default port 9)
+    echo          Echo server (default port 7)
+    http          HTTP server (default port 80)
+ -c <number>      Maximum number of connections (default and max: 20000)
+ -D <path>        HTTP pages path for HTTP server (default: current directory)
+ -n <msec>        Statistics print interval
+ -o               CSV output instead of default output
+ -Q <filename>    Output to file
+ -l <number>      Exit server after idling specified number of seconds
+
+
+Examples
+========
+
+Client examples:
+  - Send UDP data to host 10.2.1.7 on port 1234:
+      conntest -h 10.2.1.7 -P udp -p 1234
+  - Open TCP connection to 10.2.1.7 on port 80 and send HTTP request:
+      conntest -h 10.2.1.7 -P tcp -p 80 -D "GET / HTTP 1.1"
+  - Open TCP connection to fe80::250:56ff:fec0:8 via eth1
+      conntest -h fe80::250:56ff:fec0:8%eth1 -P tcp -p 80
+  - Send bogus TCP packets to 10.2.1.7 from random IP (no TCP handshake):
+      conntest -h 10.2.1.7 -r -P 6
+  - Send random 300 byte ESP packets to host 10.2.1.7 from IP 1.1.1.1:
+      conntest -h 10.2.1.7 -L 1.1.1.1 -P 50 -u -d 300
+  - Send bogus IP packet from data file, which includes IP header too:
+      conntest -P raw -Q packet.dat
+  - Send bogus IKE packets from random source IP, -D provides partial UDP
+    header which sets local and remote port to 500 (01f4):
+      conntest -h 1.1.1.1 -r -P 17 -D 0x01f401f4
+  - Send ICMP packets to 1.1.1.1, random source IP (three ways to do same):
+      conntest -P 1 -r -h 1.1.1.1
+      conntest -P raw -r -D 0x45000000000000000001 -h 1.1.1.1
+      conntest -P raw -r -D 0x4500000000000000000100000000000001010101
+
+Server examples:
+  - Start echo server on default port 7 with TCP:
+      conntest -S echo
+  - Start discard server on default port 9 with UDP:
+      conntest -S discard -P UDP
+  - Start http server on port 8080:
+      conntest -S http -K 8080 -D /var/htdocs
+
