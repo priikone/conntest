@@ -2,7 +2,7 @@
 
   conntest.c
 
-  Copyright (c) 1999 - 2010 Pekka Riikonen, priikone@iki.fi.
+  Copyright (c) 1999 - 2011 Pekka Riikonen, priikone@iki.fi.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -788,19 +788,36 @@ static inline int frame_size(int data_len)
   return data_len * 8;
 }
 
+static inline int speed_adjust(int speed, int len, unsigned long long c,
+			       unsigned long long count)
+{
+  double tmp;
+
+  /* Adjust sleep interval 10 times per second, spread evenly among all
+     threads. */
+  tmp = (double)frame_size(len) * ((double)c / (double)count);
+  tmp = tmp / (double)(((e_speed * e_speed_unit) / (double)10) / e_threads);
+  if (tmp < 0.99f || tmp > 1.01f) {
+    tmp = (double)speed * tmp;
+    speed = tmp + 0.5f;
+  }
+
+  return speed;
+}
+
 static int speed_per_usec(int data_len)
 {
   double s;
   unsigned long long v;
+
+  if (!e_speed)
+    return -1;
 
   v = rdtsc();
   usleep(100000);
   v = rdtsc() - v;
   v *= 10;
   e_freq = v / 1000; /* ms */
-
-  if (!e_speed)
-    return -1;
 
   data_len = frame_size(data_len);
 
@@ -857,7 +874,7 @@ int main(int argc, char **argv)
 {
   int i, k, l, count = 0, speed;
   char *data, opt;
-  unsigned long long v, vtot = 0;
+  unsigned long long v, vtot = 0, c = 0;
   int len, cpkts;
   struct sockets s;
   char fdata[32000];
@@ -889,7 +906,7 @@ int main(int argc, char **argv)
       switch(opt) {
       case 'V':
         fprintf(stderr,
-		"ConnTest, version 1.20 (c) 1999 - 2011 Pekka Riikonen\n");
+		"ConnTest, version 1.21 (c) 1999 - 2011 Pekka Riikonen\n");
         usage();
         break;
       case '6':
@@ -1347,11 +1364,11 @@ int main(int argc, char **argv)
     else
       k = 0;
 
-    count = 0;
+    c = count = 0;
     while(k < e_send_loop) {
-      v = rdtsc();
-
       for (i = 0; i < s.num_sockets; i++) {
+        v = rdtsc();
+
 	if (!e_quiet) {
 	  fprintf(stderr, "%5d\b\b\b\b\b", i + 1);
 	  fflush(stderr);
@@ -1368,6 +1385,14 @@ int main(int argc, char **argv)
 	      usleep(speed);
 	      cpkts = e_num_pkts;
 	    }
+
+	    c++;
+	    vtot += rdtsc() - v;
+	    if ((double)vtot / (double)e_freq >= 100) {
+	      vtot = 0;
+	      count++;
+	      speed = speed_adjust(speed, len, c, count);
+	    }
 	  } else if (e_sleep * 1000 < 1000000)
             usleep(e_sleep * 1000);
 	  else
@@ -1376,20 +1401,6 @@ int main(int argc, char **argv)
       }
       if (k >= 0)
         k++;
-
-      vtot += rdtsc() - v;
-      if ((double)vtot / (double)e_freq >= 100) {
-        double tmp;
-        vtot = 0;
-        count++;
-
-	tmp = (double)frame_size(len) * ((double)k / (double)count);
-	tmp = tmp / (double)((e_speed * e_speed_unit) / (double)10);
-        if (tmp < 0.99f || tmp > 1.01f) {
-	  tmp = (double)speed * tmp;
-	  speed = tmp + 0.5f;
-	}
-      }
     }
   }
 #ifndef WIN32
@@ -1427,11 +1438,11 @@ int main(int argc, char **argv)
     else
       k = 0;
 
-    count = 0;
+    c = count = 0;
     while(k < e_send_loop) {
-      v = rdtsc();
-
       for (i = offset; i < e_num_conn; i++) {
+        v = rdtsc();
+
 	if (!e_quiet) {
 	  fprintf(stderr, "%5d\b\b\b\b\b", i + 1);
 	  fflush(stderr);
@@ -1448,6 +1459,14 @@ int main(int argc, char **argv)
 	      usleep(speed);
 	      cpkts = e_num_pkts;
 	    }
+
+	    c++;
+	    vtot += rdtsc() - v;
+	    if ((double)vtot / (double)e_freq >= 100) {
+	      vtot = 0;
+	      count++;
+	      speed = speed_adjust(speed, len, c, count);
+	    }
 	  } else if (e_sleep * 1000 < 1000000)
             usleep(e_sleep * 1000);
 	  else
@@ -1456,20 +1475,6 @@ int main(int argc, char **argv)
       }
       if (k >= 0)
         k++;
-
-      vtot += rdtsc() - v;
-      if ((double)vtot / (double)e_freq >= 100) {
-        double tmp;
-        vtot = 0;
-        count++;
-
-	tmp = (double)frame_size(len) * ((double)k / (double)count);
-	tmp = tmp / (double)(((e_speed * e_speed_unit) / (double)10) / e_threads);
-        if (tmp < 0.99f || tmp > 1.01f) {
-	  tmp = (double)speed * tmp;
-	  speed = tmp + 0.5f;
-	}
-      }
     }
   }
 #endif
@@ -1496,7 +1501,7 @@ void thread_data_send(struct sockets *s, int offset, int num,
                       int loop, void *data, int datalen, int flood)
 {
   int i, k, cpkts = e_num_pkts, count = 0, speed;
-  unsigned long long v, vtot = 0;
+  unsigned long long v, vtot = 0, c;
   char buf[256], *cp;
 
   /* log the connections */
@@ -1517,12 +1522,12 @@ void thread_data_send(struct sockets *s, int offset, int num,
   else
     k = 0;
 
-  count = 0;
-  speed = e_speed != -1 ? 1000 : 1;
+  c = count = 0;
+  speed = e_speed != -1 ? 1000 : -1;
   while(k < loop) {
-    v = rdtsc();
-
     for (i = offset; i < num + offset; i++) {
+      v = rdtsc();
+
       if ((send_data(s, i, data, datalen)) < 0) {
         SYSLOG((LOG_ERR, "PID %d: Error sending data to connection n:o: %d\n",
                getpid(), i + 1));
@@ -1531,10 +1536,18 @@ void thread_data_send(struct sockets *s, int offset, int num,
       }
 
       if (!flood) {
-	if (speed != -1) {
+	if (e_speed != -1) {
           if (--cpkts == 0) {
 	    usleep(speed);
 	    cpkts = e_num_pkts;
+	  }
+
+	  c++;
+	  vtot += rdtsc() - v;
+	  if ((double)vtot / (double)e_freq >= 100) {
+	    vtot = 0;
+	    count++;
+	    speed = speed_adjust(speed, datalen, c, count);
 	  }
 	} else if (e_sleep * 1000 < 1000000)
           usleep(e_sleep * 1000);
@@ -1544,20 +1557,6 @@ void thread_data_send(struct sockets *s, int offset, int num,
     }
     if (k >= 0)
       k++;
-
-    vtot += rdtsc() - v;
-    if ((double)vtot / (double)e_freq >= 100) {
-      double tmp;
-      vtot = 0;
-      count++;
-
-      tmp = (double)frame_size(datalen) * ((double)k / (double)count);
-      tmp = tmp / (double)(((e_speed * e_speed_unit) / (double)10) / e_threads);
-      if (tmp < 0.99f || tmp > 1.01f) {
-	tmp = (double)speed * tmp;
-	speed = tmp + 0.5f;
-      }
-    }
   }
 
   /* close the connections */
