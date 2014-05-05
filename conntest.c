@@ -50,6 +50,7 @@ int e_num_conn;
 int e_data_len;
 int e_send_loop;
 int e_flood, e_data_flood;
+int e_sleep = 1;
 int e_threads;
 int e_proto;
 int e_do_ike = 0;
@@ -197,6 +198,7 @@ void usage()
   printf("  -d <length>     length of data to transmit (default: 1024)\n");
   printf("  -l <number>     number of loops to send data (default: infinity)\n");
   printf("  -t <number>     number of threads used in data sending (default: single)\n");
+  printf("  -n <secs>       data send interval (ignored with -F) (default: 1 second)\n");
   printf("  -f              flood, no delays creating connections (default: undefined)\n");
   printf("  -F              flood, no delays between data sends (default: undefined)\n");
   printf("  -V              display version and help\n");
@@ -258,7 +260,7 @@ int main(int argc, char **argv)
 
   if (argc > 1) {
     k = 1;
-    while((opt = getopt(argc, argv, "Vh:H:p:P:c:d:l:t:fFA:i:g:a:")) != EOF) {
+    while((opt = getopt(argc, argv, "Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:")) != EOF) {
       switch(opt) {
       case 'V':
         fprintf(stderr, "ConnTest, version 1.7 (c) 1999, 2001, 2002 Pekka Riikonen\n");
@@ -323,6 +325,13 @@ int main(int argc, char **argv)
         if (argv[k] == (char *)NULL)
           usage();
         e_threads = atoi(argv[k]);
+        k++;
+        break;
+      case 'n':
+        k++;
+        if (argv[k] == (char *)NULL)
+          usage();
+        e_sleep = atoi(argv[k]);
         k++;
         break;
       case 'f':
@@ -476,7 +485,7 @@ int main(int argc, char **argv)
         }
         
         if (!e_data_flood)
-          sleep(1);
+          sleep(e_sleep);
       }
       if (k >= 0)
         k++;
@@ -523,7 +532,7 @@ int main(int argc, char **argv)
         }
         
         if (!e_data_flood)
-          sleep(1);
+          sleep(e_sleep);
       }
       if (k >= 0)
         k++;
@@ -578,7 +587,7 @@ void thread_data_send(struct sockets *s, int offset, int num,
       }
       
       if (!flood)
-        sleep(1);
+        sleep(e_sleep);
     }
     if (k >= 0)
       k++;
