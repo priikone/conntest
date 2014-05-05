@@ -18,16 +18,27 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <string.h>
+#ifdef WIN32
+#define SYSLOG(x)
+#define strcasecmp strcmp
+#define snprintf _snprintf
+#define usleep(x) (Sleep(x / 1000))
+#define sleep(x) (Sleep(x * 1000))
+#include <windows.h>
+#include <winsock.h>
+#else
+#define SYSLOG(x) syslog x
+#include <unistd.h>
 #include <netdb.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <string.h>
 #include <syslog.h>
+#endif
 
 #include "ike.h"
 
@@ -57,6 +68,21 @@ struct sockets {
 void thread_data_send(struct sockets *s, int offset, int num, 
                       int loop, void *data, int datalen, int flood);
 
+/* Ask for permission to send broadcast packets */
+void set_broadcasting(int socket)
+{
+  int option;
+
+  option = 1;
+
+  if (setsockopt(socket, SOL_SOCKET, SO_BROADCAST,
+                 (void *) &option,
+                 sizeof(int)) < 0)
+    {
+      exit(1);
+    }
+}
+
 /* Creates a new TCP/IP or UDP/IP connection. Returns the newly created
    socket or -1 on error. */
 
@@ -66,19 +92,29 @@ int create_connection(int port, char *dhost, int index,
   int i, sock;
   struct hostent *hp;
   struct sockaddr_in desthost;
+#ifdef WIN32
+  unsigned long addr;
+#endif
 
   /* do host look up */
+#ifndef WIN32
   hp = gethostbyname(dhost);
   if (!hp) {
     fprintf(stderr, "Network (%s) is unreachable\n", dhost);
     return -1;
   }
-
   /* set socket infos */
   memset(&desthost, 0, sizeof(desthost));
   desthost.sin_port = htons(port);
   desthost.sin_family = AF_INET;
   memcpy(&desthost.sin_addr, hp->h_addr_list[0], sizeof(desthost.sin_addr));
+#else
+  memset(&desthost, 0, sizeof(desthost));
+  desthost.sin_port = htons((unsigned short)port);
+  desthost.sin_family = AF_INET;
+  addr = inet_addr(dhost);
+  memcpy(&desthost.sin_addr, &addr, sizeof(desthost.sin_addr));
+#endif
 
   /* create the connection socket */
   sock = socket(AF_INET, e_proto, 0);
@@ -101,6 +137,7 @@ int create_connection(int port, char *dhost, int index,
       fprintf(stderr, " Done.\n");
       setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void *)1, 1);
       sockets->sockets[index] = sock;
+      set_broadcasting(sock);
       return sock;
     }
   } else {
@@ -108,6 +145,7 @@ int create_connection(int port, char *dhost, int index,
 	    dhost, inet_ntoa(desthost.sin_addr));
     sockets->sockets[index] = sock;
     memcpy(&sockets->udp_dest[index], &desthost, sizeof(desthost));
+    set_broadcasting(sock);
     return sock;
   }
 
@@ -199,9 +237,18 @@ int main(int argc, char **argv)
   int len;
   struct sockets s;
 
-  e_host = "localhost";
+#ifdef WIN32
+  WORD ver = MAKEWORD( 2, 2 );
+  WSADATA wsa_data;
+
+  if (WSAStartup(ver, &wsa_data)) 
+    exit(1);
+
+#endif
+
+  e_host = "127.0.0.1";
   e_port = 9;
-  e_num_conn = 10;
+  e_num_conn = 1;
   e_data_len = 1024;
   e_send_loop = -1;
   e_flood = 0;
@@ -214,7 +261,7 @@ int main(int argc, char **argv)
     while((opt = getopt(argc, argv, "Vh:H:p:P:c:d:l:t:fFA:i:g:a:")) != EOF) {
       switch(opt) {
       case 'V':
-        fprintf(stderr, "ConnTest, version 1.6 (c) 1999, 2001 Pekka Riikonen\n");
+        fprintf(stderr, "ConnTest, version 1.7 (c) 1999, 2001, 2002 Pekka Riikonen\n");
         usage();
         break;
       case 'h':
@@ -434,7 +481,9 @@ int main(int argc, char **argv)
       if (k >= 0)
         k++;
     }
-  } else {               /* >1 threads */
+  } 
+#ifndef WIN32  
+    else {               /* >1 threads */
     int num, offset;
 
     /* Generate the threads. Every thread is supposed to have
@@ -480,7 +529,7 @@ int main(int argc, char **argv)
         k++;
     }
   }
-
+#endif
   /* close the connections */
 
   fprintf(stderr, "\nClosing connections.\n");
@@ -510,7 +559,8 @@ void thread_data_send(struct sockets *s, int offset, int num,
   cp += k;
   for (i = offset, k = 0; i < num + offset; i++)
     k += sprintf(cp + k, "%d ", i + 1);
-  syslog(LOG_INFO, "%s\n", buf);
+
+  SYSLOG((LOG_INFO, "%s\n", buf));
 
   /* do the data sending */
   if (loop < 0)
@@ -521,8 +571,8 @@ void thread_data_send(struct sockets *s, int offset, int num,
   while(k < loop) {
     for (i = offset; i < num + offset; i++) {
       if ((send_data(s->sockets[i], &s->udp_dest[i], data, datalen)) < 0) {
-        syslog(LOG_ERR, "PID %d: Error sending data to connection n:o: %d\n", 
-               getpid(), i + 1);
+        SYSLOG((LOG_ERR, "PID %d: Error sending data to connection n:o: %d\n", 
+               getpid(), i + 1));
         free(data);
         exit(1);
       }
@@ -537,8 +587,8 @@ void thread_data_send(struct sockets *s, int offset, int num,
   /* close the connections */
   for (i = offset; i < num + offset; i++)
     if ((close_connection(s->sockets[i])) < 0) {
-      syslog(LOG_ERR, "PID %d: Error closing connection n:o: %d\n", 
-             getpid(), i + 1);
+      SYSLOG((LOG_ERR, "PID %d: Error closing connection n:o: %d\n", 
+             getpid(), i + 1));
       free(data);
       exit(1);
     }

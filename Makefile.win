@@ -1,0 +1,16 @@
+RM=del
+CC=cl
+CFLAGS=-DWIN32
+
+all: conntest
+
+LIBS=ws2_32.lib
+
+conntest: conntest.obj ike.obj getopt.obj
+	$(CC) -o conntest.exe conntest.obj ike.obj getopt.obj $(LIBS)
+
+clean: 
+	-$(RM) conntest.exe conntest.obj ike.obj getopt.obj
+
+clean_objs:
+	-$(RM) conntest.obj ike.obj getopt.obj

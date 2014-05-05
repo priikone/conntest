@@ -21,19 +21,24 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <string.h>
+#include <assert.h>
+#ifdef WIN32
+#define usleep(x) (Sleep(x / 1000))
+#define sleep(x) (Sleep(x * 1000))
+#include <windows.h>
+#include <winsock.h>
+#else
+#include <unistd.h>
 #include <netdb.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <string.h>
-#include <syslog.h>
-#include <assert.h>
 #include <time.h>
-
+#endif
 /* ISAKMP payload params */
 
 /* IKE version used */
@@ -169,7 +174,7 @@ static void ike_send_s1(Negotiation neg)
   unsigned int data_len, len = 0;
   unsigned char *cp;
   int i;
-  struct in_addr ident;
+  unsigned long ident;
 
   /* Construct our first packet */
 
@@ -265,8 +270,9 @@ static void ike_send_s1(Negotiation neg)
   cp[len++] = 17;		      /* Protocol ID: UDP*/
   PUT_16(cp + len, 500);	      /* Port: IKE 500 */
   len += 2;
-  inet_aton(neg->identity, &ident);
-  memcpy(cp + len, (unsigned char *)&ident.s_addr, 4);
+  
+  ident = inet_addr(neg->identity);
+  memcpy(cp + len, (unsigned char *)&ident, 4);
   len += 4;
 
   /* Attack */
@@ -309,7 +315,7 @@ void *ike_start(void)
   /* Bind to address and port */
   memset(&local, 0, sizeof(local));
   local.sin_family = AF_INET;
-  local.sin_port = htons(port);
+  local.sin_port = htons((unsigned short)port);
   if (bind(ike->listener, (struct sockaddr *)&local, sizeof(local)) < 0) {
     perror("bind");
     fprintf(stderr, "conntest: could not create IKE listener\n");
