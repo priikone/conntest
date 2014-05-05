@@ -168,7 +168,7 @@ static int ike_recv(Negotiation neg, unsigned char *data,
 {
   int len = sizeof(neg->dest);
   return recvfrom(neg->ike->listener, data, data_len, 0, 
-		  (struct sockaddr *)&neg->dest, (socklen_t *)&len);
+                  (struct sockaddr *)&neg->dest, (unsigned int *)&len);
 }
 
 /* Send our intiation (first packet) to the responder.  Used for aggressive

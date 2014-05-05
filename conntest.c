@@ -29,8 +29,8 @@
 #define snprintf _snprintf
 #define usleep(x) (Sleep(x / 1000))
 #define sleep(x) (Sleep(x * 1000))
+#include <winsock2.h>
 #include <windows.h>
-#include <winsock.h>
 #else
 #define SYSLOG(x) syslog x
 #include <unistd.h>
@@ -183,7 +183,9 @@ int create_connection(int port, char *dhost, int index,
   /* If raw sockets and local IP is selected or is provided in data, set
      IP_HRDINCL sockopt so we can specify our own IP. */
   if (e_proto == SOCK_RAW && (e_lip || e_sock_proto == IPPROTO_RAW)) {
+#ifndef WIN32
     set_sockopt(sock, IPPROTO_IP, IP_HDRINCL, 1);
+#endif
     if (e_sock_proto != IPPROTO_RAW)
       ip4h[9] = e_sock_proto;
   }
@@ -219,6 +221,7 @@ int create_connection(int port, char *dhost, int index,
   }
 
   /* Set PMTU discovery policy */
+#ifndef WIN32
   if (e_pmtu != -1) {
     set_sockopt(sock, SOL_IP, IP_MTU_DISCOVER, e_pmtu);
     if (e_proto == SOCK_RAW && e_pmtu == 3)
@@ -232,6 +235,7 @@ int create_connection(int port, char *dhost, int index,
     if (e_proto == SOCK_RAW)
       ip4h[8] = e_ttl;
   }
+#endif
 
   /* connect to the host */
   if (e_proto == SOCK_STREAM) {
@@ -411,6 +415,7 @@ int main(int argc, char **argv)
   int len;
   struct sockets s;
   char fdata[32000];
+  FILE *f;
 
 #ifdef WIN32
   WORD ver = MAKEWORD( 2, 2 );
@@ -434,7 +439,7 @@ int main(int argc, char **argv)
     while((opt = getopt(argc, argv, "Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:D:Q:L:K:uR:m:T:r")) != EOF) {
       switch(opt) {
       case 'V':
-        fprintf(stderr, "ConnTest, version 1.10 (c) 1999, 2001, 2002, 2006, 2007, 2008 Pekka Riikonen\n");
+        fprintf(stderr, "ConnTest, version 1.11 (c) 1999, 2001, 2002, 2006, 2007, 2008 Pekka Riikonen\n");
         usage();
         break;
       case 'h':
@@ -596,7 +601,7 @@ int main(int argc, char **argv)
         k++;
         if (argv[k] == (char *)NULL)
           usage();
-	FILE *f = fopen(argv[k], "r");
+        f = fopen(argv[k], "r");
 	if (!f) {
 	  fprintf(stderr, "%s\n", strerror(errno));
 	  exit(1);
