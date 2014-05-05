@@ -95,6 +95,9 @@ int e_sock_type = PF_INET;
 int e_sock_proto = 0;
 int e_unique = 0;
 int e_random_ip = 0;
+int e_random_lport = 0;
+unsigned char e_tcp_flags = 0;
+unsigned char e_tos = 0;
 int e_pmtu = -1;
 int e_ttl = -1;
 int e_time;
@@ -107,12 +110,16 @@ unsigned long long e_freq = 0;
 
 static unsigned char ip4_header[20] = "\x45\x00\x00\x00\x00\x00\x00\x00\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 
-#define MAX_SOCKETS 30000
+#define MAX_SOCKETS 40000
 
 struct sockets {
   struct {
     int sock;
     unsigned char iph[20];
+    union {
+      unsigned char udp[8];
+      unsigned char tcp[20];
+    };
     c_sockaddr udp_dest;
     c_sockaddr udp_src;
 #ifdef MAX_SOCKETS
@@ -149,7 +156,7 @@ do {									\
 void sockets_alloc(struct sockets *s, unsigned int num)
 {
 #ifndef MAX_SOCKETS
-  s->sockets = calloc(num, sizeof(*s->sockets));
+  s->sockets = calloc(num , sizeof(*s->sockets));
   if (!s->sockets)
     exit(1);
 #endif /* !MAX_SOCKETS */
@@ -205,7 +212,13 @@ static inline void bsleep(unsigned int t)
   }
 
   end = rdtsc() + ((unsigned long long)t * (e_freq / 1000));
-  while (rdtsc() < end) ;
+  while (rdtsc() < end) {
+#if defined(__GNUC__) || defined(__ICC)
+#if defined(__i386__) || defined(__i486__) || defined(__i586__) || defined(__i686__) || defined(__i786__) || defined(__x86_64__)
+    asm volatile ("rep; nop" ::: "memory");
+#endif
+#endif
+  }
 }
 
 void hexdump(const unsigned char *data, size_t data_len,
@@ -435,6 +448,8 @@ int create_connection(int port, char *dhost, int index,
   unsigned long addr;
 #endif
   unsigned char *iph = sockets->sockets[index].iph;
+  unsigned char *udp = sockets->sockets[index].udp;
+  unsigned char *tcp = sockets->sockets[index].tcp;
   struct timeval timeo;
 
   memset(src, 0, sizeof(src));
@@ -486,6 +501,13 @@ int create_connection(int port, char *dhost, int index,
     setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, e_ifname, strlen(e_ifname));
 #endif /* SO_BINDTODEVICE */
 
+#ifdef IP_TOS
+  if (e_tos) {
+    setsockopt(sock, SOL_IP, IP_TOS, &e_tos, sizeof(e_tos));
+    iph[1] = e_tos;
+  }
+#endif /* IP_TOS */
+
   /* If raw sockets and local IP is selected or is provided in data, set
      IP_HRDINCL sockopt so we can specify our own IP. */
   if (e_proto == SOCK_RAW && (e_lip || e_sock_proto == IPPROTO_RAW)) {
@@ -523,10 +545,44 @@ int create_connection(int port, char *dhost, int index,
 #endif
     if (e_proto != SOCK_RAW) {
       if (bind(sock, (struct sockaddr *)&srchost, sizeof(srchost))) {
-        fprintf(stderr, "Could not wbind to %s:%d\n", e_lip, e_lport);
+        fprintf(stderr, "Could not bind to %s:%d\n", e_lip, e_lport);
         exit(1);
       }
     }
+  }
+
+  /* If user provided header (-D) is not present in raw UDP protocol, let's
+     provide valid UDP header. */
+  if (e_proto == SOCK_RAW && e_sock_proto == IPPROTO_UDP && !e_want_ip6 &&
+      !e_header) {
+    if (!srchost.sin.sin_port)
+      PUT16(udp, 9);
+    else
+      memcpy(udp, &srchost.sin.sin_port, 2);
+    memcpy(udp + 2, &desthost.sin.sin_port, 2);
+    if (e_lip)
+      PUT16(udp + 4, e_data_len - 20);
+    else
+      PUT16(udp + 4, e_data_len);
+    PUT16(udp + 6, 0);		/* But no checksum */
+  }
+
+  /* If user provided header (-D) is not present in raw TCP protocol, let's
+     provide "valid" TCP header. */
+  if (e_proto == SOCK_RAW && e_sock_proto == IPPROTO_TCP && !e_want_ip6 &&
+      !e_header) {
+    if (!srchost.sin.sin_port)
+      PUT16(tcp, 9);
+    else
+      memcpy(tcp, &srchost.sin.sin_port, 2);
+    memcpy(tcp + 2, &desthost.sin.sin_port, 2);
+    PUT32(tcp + 4, 1);		/* seqno */
+    PUT32(tcp + 8, 0);		/* ack */
+    tcp[12] = 0x50;		/* length */
+    tcp[13] = e_tcp_flags;	/* flags, 8 bits */
+    PUT16(tcp + 14, 10000);	/* window size */
+    PUT16(tcp + 16, 0);		/* bogus checksum */
+    PUT16(tcp + 18, 0);		/* urg */
   }
 
   /* Set PMTU discovery policy */
@@ -623,7 +679,7 @@ int close_connection(int sock)
 
 int send_data(struct sockets *s, int index, void *data, unsigned int len)
 {
-  int ret, i;
+  int ret, i, off = 0;
   int sock = s->sockets[index].sock;
   unsigned char *iph = s->sockets[index].iph;
   c_sockaddr *udp = &s->sockets[index].udp_dest;
@@ -667,8 +723,24 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
     /* IPv4 */
 
     /* If raw sockets and local IP is specified, now copy the IP header */
-    if (e_proto == SOCK_RAW && (e_lip || e_sock_proto == IPPROTO_RAW))
+    if (e_proto == SOCK_RAW && (e_lip || e_sock_proto == IPPROTO_RAW)) {
       memcpy(d, iph, 20);
+      off = 20;
+    }
+
+    /* If user provided header is not present in raw UDP/TCP protocol, let's
+       provide valid pre-built header. */
+    if (e_proto == SOCK_RAW && e_sock_proto == IPPROTO_UDP && !e_header)
+      memcpy(d + off, s->sockets[index].udp, 8);
+    else if (e_proto == SOCK_RAW && e_sock_proto == IPPROTO_TCP && !e_header)
+      memcpy(d + off, s->sockets[index].tcp, 20);
+
+    /* Randomize source port if requested */
+    if (e_random_lport) {
+      d[off] = d[15] ^= (e_time ^ (e_time >> 11));
+      d[off + 1] = d[14] ^= d[13] ^ ((d[12] << 7) & 0x9d2c5680UL);
+      e_time += 2749;
+    }
 
     /* Randomize source IP if requested */
     if (e_random_ip) {
@@ -699,19 +771,22 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
   if (e_proto == SOCK_STREAM) {
     ret = send(sock, data, len, 0);
     if (ret < 0) {
-      fprintf(stderr, "send(sock:%d): %s (%d)\n", sock, strerror(errno), errno);
+      fprintf(stderr, "send(sock:%d %d): %s (%d) (pid %d)\n", sock, index,
+	      strerror(errno), errno, getpid());
       return -1;
     }
   } else if (e_proto == SOCK_RAW && e_want_ip6) {
     ret = sendmsg(sock, &msg, 0);
     if (ret < 0) {
-      fprintf(stderr, "sendmsg(sock:%d): %s (%d)\n", sock, strerror(errno), errno);
+      fprintf(stderr, "sendmsg(sock:%d %d): %s (%d) (pid %d)\n", sock, index,
+	      strerror(errno), errno, getpid());
       return -1;
     }
   } else {
     ret = sendto(sock, data, len, 0, &udp->sa, SIZEOF_SOCKADDR(*udp));
     if (ret < 0) {
-      fprintf(stderr, "sendto(sock:%d): %s (%d)\n", sock, strerror(errno), errno);
+      fprintf(stderr, "sendto(sock:%d %d): %s (%d) (pid %d)\n", sock, index,
+	      strerror(errno), errno, getpid());
       return -1;
     }
   }
@@ -729,6 +804,8 @@ void usage()
   printf(" -L <IP>          Local IP to use if possible (default: auto)\n");
   printf(" -R <IP-IP>       Local IP range when -P is 'raw' or integer value (ipv4)\n");
   printf(" -r               Use random source IP when -P is 'raw' or integer value (ipv4)\n");
+  printf(" -b               Use random source port when -P is 'raw' or integer value (ipv4)\n");
+  printf(" -B               TCP flags bitmask (8 bits), -P is 6 for TCP (ipv4)\n");
   printf(" -K <port>        Local port to use if possible (default: auto)\n");
   printf(" -P <protocol>    Protocol, 'tcp', 'udp', 'raw' or integer value\n");
   printf(" -c <number>      Number of connections (default: 1)\n");
@@ -741,6 +818,7 @@ void usage()
   printf(" -s <speed><unit> Rate/sec, Units: SI: kbit, Mbit, Gbit, IEC-27: Kib, Mib, Gib\n");
   printf(" -m <pmtu>        PMTU discovery: 0 no PMTU, 2 do PMTU, 3 set DF, ignore PMTU\n");
   printf(" -T <ttl>         Set TTL, 0-255, can be used with raw protocols as well\n");
+  printf(" -C <dscp-ecn>    Set DSCP and/or ECN (ECN only with -P 'raw' or integer)\n");
   printf(" -I <ifname>      Bind to specified interface, eg. eth0\n");
   printf(" -u               Each packet will have unique data payload\n");
   printf(" -f               Flood, no delays creating connections (default: undefined)\n");
@@ -924,13 +1002,13 @@ int main(int argc, char **argv)
   if (argc > 1) {
     k = 1;
     while((opt = getopt(argc, argv,
-			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:s:D:Q:L:K:uR:m:T:rq64xI:"))
+			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:s:D:Q:L:K:uR:m:T:rq64xI:bB:C:"))
 	  != EOF) {
       switch(opt) {
       case 'V':
         fprintf(stderr,
-		"ConnTest, version 1.22 (c) 1999 - 2011 Pekka Riikonen\n");
-        usage();
+		"ConnTest, version 1.24 (c) 1999 - 2012 Pekka Riikonen\n");
+	exit(0);
         break;
       case '6':
 	e_want_ip6 = 1;
@@ -984,6 +1062,17 @@ int main(int argc, char **argv)
         k++;
         e_random_ip = 1;
 	e_lip = strdup("1.2.3.4");
+        break;
+      case 'b':
+        k++;
+        e_random_lport = 1;
+        break;
+      case 'B':
+        k++;
+        if (argv[k] == (char *)NULL)
+          usage();
+        e_tcp_flags = (unsigned char)atoi(argv[k]);
+        k++;
         break;
       case 'p':
         k++;
@@ -1195,6 +1284,13 @@ int main(int argc, char **argv)
         if (argv[k] == (char *)NULL)
           usage();
 	e_ttl = atoi(argv[k]);
+        k++;
+	break;
+      case 'C':
+        k++;
+        if (argv[k] == (char *)NULL)
+          usage();
+	e_tos = (unsigned char)atoi(argv[k]);
         k++;
 	break;
       case 'a':
@@ -1464,8 +1560,9 @@ int main(int argc, char **argv)
       k = 0;
 
     c = count = 0;
+    num = num + offset > s.num_sockets ? s.num_sockets : num + offset;
     while(k < e_send_loop) {
-      for (i = offset; i < e_num_conn; i++) {
+      for (i = offset; i < num; i++) {
         v = rdtsc();
 
 	if (!e_quiet) {
@@ -1527,16 +1624,12 @@ void thread_data_send(struct sockets *s, int offset, int num,
 {
   int i, k, cpkts = e_num_pkts, count = 0, speed;
   unsigned long long v, vtot = 0, c;
-  char buf[256], *cp;
+  char buf[256];
 
   /* log the connections */
-  cp = buf;
-  k = sprintf(cp, "PID %d sends data (%d bytes) to connections: ",
-              getpid(), datalen);
-  cp += k;
-  for (i = offset, k = 0; i < num + offset; i++)
-    k += sprintf(cp + k, "%d ", i + 1);
-
+  num = num + offset > s->num_sockets ? s->num_sockets : num + offset;
+  sprintf(buf, "PID %d sends data (%d bytes) to %d connections",
+              getpid(), datalen, num);
   SYSLOG((LOG_INFO, "%s\n", buf));
 
   e_time = time(NULL) * 2;
@@ -1549,8 +1642,9 @@ void thread_data_send(struct sockets *s, int offset, int num,
 
   c = count = 0;
   speed = e_speed != -1 ? 1000 : -1;
+
   while(k < loop) {
-    for (i = offset; i < num + offset; i++) {
+    for (i = offset; i < num; i++) {
       v = rdtsc();
 
       if ((send_data(s, i, data, datalen)) < 0) {
@@ -1585,7 +1679,7 @@ void thread_data_send(struct sockets *s, int offset, int num,
   }
 
   /* close the connections */
-  for (i = offset; i < num + offset; i++)
+  for (i = offset; i < num; i++)
     if ((close_connection(s->sockets[i].sock)) < 0) {
       SYSLOG((LOG_ERR, "PID %d: Error closing connection n:o: %d\n",
              getpid(), i + 1));
