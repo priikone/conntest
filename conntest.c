@@ -578,8 +578,14 @@ int create_server(int port, char *local_ip, int index,
   } else {
     /* Any address */
     memset(&server, 0, sizeof(server));
-    server.sin.sin_family = e_sock_type;
-    server.sin.sin_addr.s_addr = INADDR_ANY;
+    if (e_want_ip6) {
+      e_sock_type = PF_INET6;
+      server.sin6.sin6_family = e_sock_type;
+      server.sin6.sin6_addr = in6addr_any;
+    } else {
+      server.sin.sin_family = e_sock_type;
+      server.sin.sin_addr.s_addr = INADDR_ANY;
+    }
     if (port)
       server.sin.sin_port = htons(port);
   }
@@ -1286,7 +1292,7 @@ int main(int argc, char **argv)
       switch(opt) {
       case 'V':
         fprintf(stderr,
-		"ConnTest, version 1.30 (c) 1999 - 2013 Pekka Riikonen\n");
+		"ConnTest, version 1.31 (c) 1999 - 2013 Pekka Riikonen\n");
 	exit(0);
         break;
       case '?':
