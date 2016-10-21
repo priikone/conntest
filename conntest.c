@@ -129,6 +129,7 @@ FILE *e_output = NULL;
 int e_csv = 0;
 int e_exit_limit = 0;
 unsigned int e_diag = 0;
+int e_gstats = 0;
 
 unsigned char read_buf[65536];
 
@@ -148,6 +149,18 @@ static unsigned char ip4_header[20] = "\x45\x00\x00\x00\x00\x00\x00\x00\xff\x00\
 #define SERVER 1
 
 #define HTTP_HEADER   "HTTP/1.1 200 OK\r\nServer: ConnTestHTTP/1.0\r\n"
+
+unsigned long long g_recv_pkts;
+unsigned long long g_send_pkts;
+double g_recv_bytes;
+double g_send_bytes;
+unsigned int g_time;
+unsigned long long g_p_recv_pkts;
+unsigned long long g_p_send_pkts;
+double g_p_recv_bytes;
+double g_p_send_bytes;
+unsigned int g_p_time;
+unsigned long long g_conns;
 
 struct socket_conn {
   struct socket_conn *next;
@@ -358,6 +371,47 @@ void hexdump(const unsigned char *data, size_t data_len,
     if (count < 16)
       break;
   }
+}
+
+unsigned short ipv4_pseudo(void *iph, unsigned int len,
+                           unsigned char ipproto)
+{
+  unsigned short *ip_h = (unsigned short *)iph;
+  unsigned int csum;
+
+  csum = htons(len);
+  csum += (unsigned short)(ipproto << 8);
+  csum += (unsigned short)ip_h[6];
+  csum += (unsigned short)ip_h[7];
+  csum += (unsigned short)ip_h[8];
+  csum += (unsigned short)ip_h[9];
+
+  while (csum >> 16)
+    csum = (csum >> 16) + (csum & 0xffff);
+
+  return csum;
+}
+
+unsigned short do_csum(unsigned char *d, int len)
+{
+  unsigned int csum = 0;
+
+  while (len > 1) {
+    csum += (*((unsigned short *)d)) & 0xffff;
+    d += 2;
+    len -= 2;
+
+    if (csum & 0x80000000)
+      csum = (csum & 0xFFFF) + (csum >> 16);
+  }
+
+  if (len > 0)
+    csum += *d;
+
+  while (csum >> 16)
+    csum = (csum >> 16) + (csum & 0xffff);
+
+  return ~(unsigned short)csum;
 }
 
 void thread_data_send(struct sockets *s, int offset, int num,
@@ -1005,6 +1059,28 @@ int send_data(struct sockets *s, int index, void *data, unsigned int len)
     hexdump(data, len, stdout);
   }
 
+#if 0
+  if (e_proto == SOCK_RAW && e_sock_proto == IPPROTO_UDP && !e_header) {
+    if (e_want_ip6) {
+
+    } else {
+    }
+  } else if (e_proto == SOCK_RAW && e_sock_proto == IPPROTO_TCP && !e_header) {
+    if (e_want_ip6) {
+
+    } else {
+      unsigned char *tcph = data + 20;
+      fprintf(stderr, "\n");
+      fprintf(stderr, "%d %d\n", len, e_sock_proto);
+      csum = ipv4_pseudo(data, len - 20, e_sock_proto);
+      PUT16(tcph + 16, csum);
+      csum = do_csum(tcph, len - 20);
+      fprintf(stderr, "%x\n", csum);
+      PUT16(tcph + 16, csum);
+    }
+  }
+#endif
+
   if (e_proto == SOCK_STREAM) {
     ret = send(sock, data, len, 0);
     if (ret < 0) {
@@ -1099,6 +1175,7 @@ void usage_help(void)
 	);
   printf(" -D <path>        HTTP pages path for HTTP server (default: current directory)\n");
   printf(" -n <msec>        Statistics print interval\n");
+  printf(" -G               Print global statistics (no per-connection stats)\n");
   printf(" -o               CSV output instead of default output\n");
   printf(" -Q <filename>    Output to file\n");
   printf(" -l <number>      Exit server after idling specified number of seconds\n");
@@ -1287,12 +1364,12 @@ int main(int argc, char **argv)
   if (argc > 1) {
     k = 1;
     while((opt = getopt(argc, argv,
-			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:s:D:Q:L:K:uR:m:T:rq64xI:S:bB:C:oO"))
+			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:s:D:Q:L:K:uR:m:T:rq64xI:S:bB:C:oOG"))
 	  != EOF) {
       switch(opt) {
       case 'V':
         fprintf(stderr,
-		"ConnTest, version 1.31 (c) 1999 - 2013 Pekka Riikonen\n");
+		"ConnTest, version 1.32 (c) 1999 - 2016 Pekka Riikonen\n");
 	exit(0);
         break;
       case '?':
@@ -1621,6 +1698,10 @@ int main(int argc, char **argv)
         k++;
         e_diag = 1;
 	break;
+      case 'G':
+        k++;
+        e_gstats = 1;
+        break;
       default:
         usage();
         break;
@@ -2253,6 +2334,210 @@ static double scale_bits(double val, const char **ret_unit)
   return val;
 }
 
+int hprint = 0;
+
+static void print_gstats(int end)
+{
+  const char *unit;
+  double val;
+  int sec;
+  time_t t;
+  struct tm *tm;
+
+  if (!e_gstats)
+    return;
+
+  g_time += e_sleep;
+
+  if (g_p_recv_bytes == g_recv_bytes &&
+      g_p_send_bytes == g_send_bytes)
+    return;
+
+  g_p_time = g_time;
+
+  sec = e_sleep / 1000;
+  if (!sec)
+    sec = 1;
+
+  if (end)
+    sec = g_time / 1000;
+
+  if (e_csv) {
+    /* CSV output */
+    if (!hprint) {
+      fprintf(e_output,
+	      "Timestamp,ID,IP,Port,Interval,Rx,Rx/s,Rx Pkts,Rx Pkts/s,Tx,Tx/s,Tx Pkts,Tx Pkts/s,Conns\n");
+      hprint = 1;
+    }
+
+    t = time(NULL);
+    tm = localtime(&t);
+    fprintf(e_output, "%04d-%02d-%02d %02d:%02d:%02d,", tm->tm_year + 1900, tm->tm_mon, tm->tm_mday,
+            tm->tm_hour, tm->tm_min, tm->tm_sec);
+
+    fprintf(e_output, "%x,", -1);
+    fprintf(e_output, "%s,%d,", "0.0.0.0", -1);
+
+    if (!end)
+      fprintf(e_output, "%u.%u-%u.%u,",
+	      g_p_time / 1000, g_p_time % 1000,
+	      g_time / 1000, g_p_time % 1000);
+    else
+      fprintf(e_output, "%u.%u-%u.%u,", 0, 0,
+	      g_time / 1000, g_p_time % 1000);
+
+    if (!end)
+      val = g_recv_bytes - g_p_recv_bytes;
+    else
+      val = g_recv_bytes;
+    fprintf(e_output, "%.2f,", val);
+
+    if (!end) {
+      val = (g_recv_bytes - g_p_recv_bytes) * 8.0;
+      fprintf(e_output, "%.2f,", val / (double)sec);
+    } else {
+      val = g_recv_bytes * 8.0;
+      fprintf(e_output, "%.2f,", val / sec);
+    }
+
+    if (e_proto == SOCK_DGRAM) {
+      if (!end)
+        fprintf(e_output, "%llu,", (g_recv_pkts - g_p_recv_pkts));
+      else
+        fprintf(e_output, "%llu,", g_recv_pkts);
+      if (!end)
+        fprintf(e_output, "%llu,", (g_recv_pkts - g_p_recv_pkts) / sec);
+      else
+        fprintf(e_output, "%llu,", g_recv_pkts / sec);
+    } else {
+      fprintf(e_output, "0,0,");
+    }
+
+    if (e_server_mode == SERVER_ECHO || e_server_mode == SERVER_HTTP) {
+      if (!end)
+        val = g_send_bytes - g_p_send_bytes;
+      else
+        val = g_send_bytes;
+      fprintf(e_output, "%.2f,", val);
+
+      if (!end) {
+        val = (g_send_bytes - g_p_send_bytes) * 8.0;
+        fprintf(e_output, "%.2f,", val / (double)sec);
+      } else {
+        val = g_send_bytes * 8.0;
+        fprintf(e_output, "%.2f,", val / sec);
+      }
+
+      if (e_proto == SOCK_DGRAM) {
+        if (!end)
+          fprintf(e_output, "%llu,", (g_send_pkts - g_p_send_pkts));
+        else
+          fprintf(e_output, "%llu,", g_send_pkts);
+        if (!end)
+          fprintf(e_output, "%llu", (g_send_pkts - g_p_send_pkts) / sec);
+        else
+          fprintf(e_output, "%llu", g_send_pkts / sec);
+      } else {
+        fprintf(e_output, "0,0");
+      }
+    } else {
+      fprintf(e_output, "0,0,0,0");
+    }
+    fprintf(e_output, ",%llu", g_conns);
+    fprintf(e_output, "\n");
+
+    goto out;
+  }
+
+  /* Normal output */
+
+  if (!hprint) {
+    fprintf(e_output,
+	    "[%4s]   Interval         Rx          Rx/s", "ID");
+    if (e_proto == SOCK_DGRAM)
+      fprintf(e_output, "            Rx Pkts     Rx Pkt/s");
+    if (e_server_mode == SERVER_ECHO || e_server_mode == SERVER_HTTP) {
+      fprintf(e_output,
+	    "      Tx          Tx/s");
+      if (e_proto == SOCK_DGRAM)
+        fprintf(e_output, "           Tx Pkts     Tx Pkt/s");
+    }
+    fprintf(e_output, "\n");
+    hprint = 1;
+  }
+
+  fprintf(e_output, "[%x]", -1);
+
+  if (!end)
+    fprintf(e_output, "   %2u.%u-%2u.%us",
+	    g_p_time / 1000, g_p_time % 1000,
+	    g_time / 1000, g_p_time % 1000);
+  else
+    fprintf(e_output, "   %2u.%u-%2u.%us", 0, 0,
+	    g_time / 1000, g_p_time % 1000);
+
+  if (!end)
+    val = scale_bytes(g_recv_bytes - g_p_recv_bytes, &unit);
+  else
+    val = scale_bytes(g_recv_bytes, &unit);
+  fprintf(e_output, " %8.2f %s", val, unit);
+
+  if (!end) {
+    val = scale_bits((g_recv_bytes - g_p_recv_bytes) * 8.0, &unit);
+    fprintf(e_output, " %8.2f %s/s", val / (double)sec, unit);
+  } else {
+    val = scale_bits(g_recv_bytes * 8.0, &unit);
+    fprintf(e_output, " %8.2f %s/s", val / sec, unit);
+  }
+
+  if (e_proto == SOCK_DGRAM) {
+    if (!end)
+      fprintf(e_output, " %9llu p", (g_recv_pkts - g_p_recv_pkts));
+    else
+      fprintf(e_output, " %9llu p", g_recv_pkts);
+    if (!end)
+      fprintf(e_output, " %8llu p/s", (g_recv_pkts - g_p_recv_pkts) / sec);
+    else
+      fprintf(e_output, " %8llu p/s", g_recv_pkts / sec);
+  }
+
+  if (e_server_mode == SERVER_ECHO || e_server_mode == SERVER_HTTP) {
+    if (!end)
+      val = scale_bytes(g_send_bytes - g_p_send_bytes, &unit);
+    else
+      val = scale_bytes(g_send_bytes, &unit);
+    fprintf(e_output, " %8.2f %s", val, unit);
+
+    if (!end) {
+      val = scale_bits((g_send_bytes - g_p_send_bytes) * 8.0, &unit);
+      fprintf(e_output, " %8.2f %s/s", val / (double)sec, unit);
+    } else {
+      val = scale_bits(g_send_bytes * 8.0, &unit);
+      fprintf(e_output, " %8.2f %s/s", val / sec, unit);
+    }
+
+    if (e_proto == SOCK_DGRAM) {
+      if (!end)
+        fprintf(e_output, " %9llu p", (g_send_pkts - g_p_send_pkts));
+      else
+        fprintf(e_output, " %9llu p", g_send_pkts);
+      if (!end)
+        fprintf(e_output, " %8llu p/s", (g_send_pkts - g_p_send_pkts) / sec);
+      else
+        fprintf(e_output, " %8llu p/s", g_send_pkts / sec);
+    }
+  }
+
+  fprintf(e_output, "\n");
+
+ out:
+  fflush(e_output);
+  g_p_recv_bytes = g_recv_bytes;
+  g_p_recv_pkts = g_recv_pkts;
+  g_p_send_bytes = g_send_bytes;
+  g_p_send_pkts = g_send_pkts;
+}
+
 static void print_conn(struct socket_conn *conn, struct socket *sock, int end)
 {
   const char *unit;
@@ -2260,6 +2545,9 @@ static void print_conn(struct socket_conn *conn, struct socket *sock, int end)
   int sec;
   time_t t;
   struct tm *tm;
+
+  if (e_gstats)
+    return;
 
   if (conn->p_recv_bytes == conn->recv_bytes &&
       conn->p_send_bytes == conn->send_bytes && !end)
@@ -2513,6 +2801,7 @@ void close_conn(struct socket *sock, struct socket_conn *conn, int epfd, int err
     }
 
     e_num_conn++;
+    g_conns--;
 
     free(conn->buf);
     free(conn->ip);
@@ -2680,6 +2969,8 @@ struct socket_conn *add_conn(struct sockets *s, int sock, c_sockaddr *remote,
   conn->port = port;
   conn->diag = e_diag;
 
+  g_conns++;
+
   return conn;
 }
 
@@ -2713,6 +3004,7 @@ int conn_send(unsigned char *buf, struct socket *sock,
       conn->buf_len -= ret;
       conn->buf_off += ret;
       conn->send_bytes += ret;
+      g_send_bytes += ret;
       if (!conn->buf_len)
 	break;
     }
@@ -2726,6 +3018,8 @@ int conn_send(unsigned char *buf, struct socket *sock,
 	conn->buf_off += ret;
 	conn->send_bytes += ret;
 	conn->send_pkts++;
+	g_send_bytes += ret;
+	g_send_pkts++;
       }
     } else {
       /* Send all pending data from all connections */
@@ -3061,6 +3355,8 @@ void thread_server(struct sockets *s, int offset, int num)
   }
 
   if (e_threads == 1 && (ret == 0 || (rdtsc() - to) / e_freq >= e_sleep)) {
+    print_gstats(1);
+
     /* Timeout */
     for (i = 0; i < num_fds; i++) {
       sock = fds[i].data.ptr;
@@ -3094,6 +3390,7 @@ void thread_server(struct sockets *s, int offset, int num)
 	/* Discard server.  We read everything and discard it. */
 	while ((len = read(fd, buf, sizeof(buf))) > 0) {
 	  conn->recv_bytes += len;
+	  g_recv_bytes += len;
 	  conn_diag_check(conn, buf, len);
         }
 
@@ -3121,6 +3418,7 @@ void thread_server(struct sockets *s, int offset, int num)
 	  b = conn->buf ? conn->buf : buf;
 	  while ((len = read(fd, b, sizeof(buf))) > 0) {
 	    conn->recv_bytes += len;
+	    g_recv_bytes += len;
 
 	    conn_diag_check(conn, buf, len);
 
@@ -3172,6 +3470,7 @@ void thread_server(struct sockets *s, int offset, int num)
 	  len = read(fd, conn->buf + conn->buf_off, 65535 - conn->buf_off);
 	  if (len > 0) {
 	    conn->recv_bytes += len;
+	    g_recv_bytes += len;
 
 	    if (conn->buf_len == 0)
 	      conn->buf_off = 0;
@@ -3248,6 +3547,8 @@ void thread_server(struct sockets *s, int offset, int num)
 	  }
 	  conn->recv_bytes += len;
 	  conn->recv_pkts++;
+	  g_recv_bytes += len;
+	  g_recv_pkts++;
 	  conn_diag_check(conn, buf, len);
 	}
 
@@ -3278,6 +3579,8 @@ void thread_server(struct sockets *s, int offset, int num)
 	    }
 	    conn->recv_bytes += len;
 	    conn->recv_pkts++;
+	    g_recv_bytes += len;
+	    g_recv_pkts++;
 
 	    conn_diag_check(conn, buf, len);
 
