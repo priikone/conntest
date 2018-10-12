@@ -1578,7 +1578,7 @@ int main(int argc, char **argv)
       switch(opt) {
       case 'V':
         fprintf(stderr,
-		"ConnTest, version 1.32 (c) 1999 - 2016 Pekka Riikonen\n");
+		"ConnTest, version 1.33 (c) 1999 - 2016 Pekka Riikonen\n");
 	exit(0);
         break;
       case '?':
