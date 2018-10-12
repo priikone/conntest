@@ -33,6 +33,9 @@
 #include <windows.h>
 #else
 #define SYSLOG(x) syslog x
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 201112L
+#endif
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -41,7 +44,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <netdb.h>
+#include <net/if.h>
 #include <netinet/tcp.h>
 #include <syslog.h>
 #include <sys/epoll.h>
@@ -80,6 +85,7 @@ char *e_host = NULL;
 char *e_ip_start = NULL;
 char *e_ip_end = NULL;
 char *e_lip = NULL;
+char *e_sip = NULL; // Source IP for multicast.
 char *e_lip_start = NULL;
 char *e_lip_end = NULL;
 int e_lip_s = 1;
@@ -430,6 +436,15 @@ int is_ip6(const char *addr)
   return 1;
 }
 
+static int is_mc(c_sockaddr *addr, int ipv6)
+{
+  if (!ipv6)
+    {
+      return !!IN_MULTICAST(ntohl(addr->sin.sin_addr.s_addr));
+    }
+  return !!IN6_IS_ADDR_MULTICAST(&addr->sin6.sin6_addr);
+}
+
 int c_gethostbysock(int sock, char *ip, int ip_len)
 {
   struct sockaddr_storage remote;
@@ -605,11 +620,93 @@ int set_sockopt2(int socket, int t, int s, void *optval, int optlen)
   return 0;
 }
 
+static int join_mc4(int sock, int ifindex, const c_sockaddr *server,
+                    const char *mc_source)
+{
+  union {
+      struct ip_mreqn group_join;
+      struct ip_mreq_source group_join_source;
+  } req;
+  size_t size;
+
+  memset(&req, 0, sizeof(req));
+
+  req.group_join.imr_multiaddr = server->sin.sin_addr;
+  /* It would be nice to just join IP_MULTICAST_IF here and be done with ifindex
+     but it seems the kernel doesn't check inet->mc_ifindex and doesn't find the
+     device when joining the group */
+
+  if (mc_source)
+    {
+      size = sizeof(req.group_join_source);
+      if (inet_pton(AF_INET, mc_source,
+                    &req.group_join_source.imr_sourceaddr) != 1)
+        {
+          fprintf(stderr, "Failed to convert %s to IP address: %s\n", mc_source,
+                  strerror(errno));
+          return -1;
+        }
+      /* Since the group_join from source requires an IP address instead of an
+         ifindex, solve the interface and use any IP address on that interface
+         for the join request */
+      if (ifindex != -1)
+        {
+          struct ifaddrs *addrs;
+
+          if (!getifaddrs(&addrs))
+            {
+              struct ifaddrs *iter;
+
+              for (iter = addrs; iter; iter = iter->ifa_next)
+                {
+                  unsigned int iter_ifindex = if_nametoindex(iter->ifa_name);
+
+                  if (iter_ifindex && iter_ifindex == (unsigned int)ifindex &&
+                      iter->ifa_addr &&
+                      iter->ifa_addr->sa_family == AF_INET)
+                    {
+                      req.group_join_source.imr_interface =
+                        ((struct sockaddr_in *)iter->ifa_addr)->sin_addr;
+                    }
+                }
+              freeifaddrs(addrs);
+            }
+          else
+            {
+              fprintf(stderr, "Failed to get interfaces: %s\n",
+                      strerror(errno));
+            }
+        }
+    }
+  else
+    {
+      size = sizeof(req.group_join);
+      if (ifindex != -1)
+        {
+          req.group_join.imr_ifindex = ifindex;
+        }
+    }
+
+  if (setsockopt(sock, IPPROTO_IP,
+                 (mc_source) ? IP_ADD_SOURCE_MEMBERSHIP : IP_ADD_MEMBERSHIP,
+                 (void *)&req.group_join_source, size) < 0)
+    {
+      int err_save = errno;
+      char ipstr[INET6_ADDRSTRLEN];
+
+      fprintf(stderr, "Failed to join group: %s source: %s: %s\n",
+              inet_ntop(AF_INET, &server->sin.sin_addr, ipstr, sizeof(ipstr)),
+              mc_source, strerror(err_save));
+      return -1;
+    }
+  return 0;
+}
+
 /* Creates a new TCP/IP or UDP/IP server */
 
 int create_server(int port, char *local_ip, int index,
 		  struct sockets *sockets,
-		  int rport, char *remote_ip)
+		  int rport, char *remote_ip, const char *mc_source)
 {
   int i, sock;
   c_sockaddr server, remote;
@@ -666,8 +763,36 @@ int create_server(int port, char *local_ip, int index,
     return -1;
   }
 
-  /* If UDP and remote host/port is provided, set to connected state */
-  if (e_proto == SOCK_DGRAM && rport && remote_ip) {
+  /* If UDP to multicast group, add group memberships */
+  if (e_proto == SOCK_DGRAM && local_ip && is_mc(&server, is_ip6(s)))
+    {
+      int ifindex = -1;
+
+      if (e_ifname)
+        {
+          ifindex = if_nametoindex(e_ifname);
+          if (ifindex < 0)
+            {
+              fprintf(stderr, "Failed to solve ifindex for %s: %s", e_ifname,
+                      strerror(errno));
+              return -1;
+            }
+        }
+      if (!is_ip6(s))
+        {
+          if (join_mc4(sock, ifindex, &server, mc_source))
+            {
+              return -1;
+            }
+        }
+      else
+        {
+          fprintf(stderr, "IPv6 multicast joining not implementd, sorry\n");
+          return -1;
+        }
+    }
+  /* Else if UDP and remote host/port is provided, set to connected state */
+  else if (e_proto == SOCK_DGRAM && rport && remote_ip) {
     if (!c_gethostbyname(remote_ip, e_want_ip6, r, sizeof(r), NULL, 0,
 			 &e_sock_type, rport, &remote)) {
       fprintf(stderr, "Host (%s) is unreachable\n", remote_ip);
@@ -889,8 +1014,11 @@ int create_connection(int port, char *dhost, int index,
 
   /* Set TTL */
   if (e_ttl != -1) {
-    if (e_ttl)
-      set_sockopt(sock, IPPROTO_IP, IP_TTL, e_ttl);
+    if (e_ttl) {
+      int option = is_mc(&desthost, e_want_ip6) ? IP_MULTICAST_TTL : IP_TTL;
+
+      set_sockopt(sock, IPPROTO_IP, option, e_ttl);
+    }
     if (e_proto == SOCK_RAW && !e_want_ip6)
       iph[8] = e_ttl;
   }
@@ -1127,6 +1255,7 @@ void usage_help(void)
   printf(" -C <dscp-ecn>    Set DSCP and/or ECN (ECN only with -P 'raw' or integer)\n");
   printf(" -f               Flood, no delays creating sockets (default: undefined)\n");
   printf(" -u               Each packet will have unique data payload\n");
+  printf(" -U               Max out how many open file descriptors allowed\n");
   printf(" -q               Quiet, don't display anything\n");
   printf(" -6               Use/prefer IPv6 addresses\n");
   printf(" -4               Force IPv4 (no IPv6 support)\n");
@@ -1179,6 +1308,7 @@ void usage_help(void)
   printf(" -o               CSV output instead of default output\n");
   printf(" -Q <filename>    Output to file\n");
   printf(" -l <number>      Exit server after idling specified number of seconds\n");
+  printf(" -M <IP>          If listening for multicast, source for multicast join\n");
 }
 
 void usage_examples(void)
@@ -1332,6 +1462,85 @@ do {									\
     }									\
 } while(0)
 
+static int solve_separated_start_and_end(uint32_t *start, uint32_t *end,
+                                         char *start_str, char *end_str,
+                                         char **scope)
+{
+  if (!e_force_ip4 && is_ip6(start_str))
+    e_want_ip6 = 1;
+
+  if (e_want_ip6) {
+    uint32_t start_addr[4], end_addr[4];
+
+    if (strchr(start_str, '%')) {
+      *scope = strdup(strchr(start_str, '%'));
+      *strchr(start_str, '%') = '\0';
+      if (strchr(end_str, '%'))
+        *strchr(end_str, '%') = '\0';
+    }
+
+    if (inet_pton(AF_INET6, start_str, &start_addr) < 0 ||
+        inet_pton(AF_INET6, end_str, &end_addr) < 0) {
+       fprintf(stderr, "Failed to solve %s or %s to ipv6: %s",
+               start_str, end_str, strerror(errno));
+       exit(1);
+    }
+      *start = start_addr[3];
+      *end = end_addr[3];
+    } else {
+      uint32_t start_addr, end_addr;
+
+      if (inet_pton(AF_INET, start_str, &start_addr) < 0 ||
+          inet_pton(AF_INET, end_str, &end_addr) < 0)
+        {
+          fprintf(stderr, "Failed to solve %s or %s with inet_pton: %s",
+                  start_str, end_str, strerror(errno));
+          exit(1);
+        }
+
+      *start = ntohl(start_addr);
+      *end = ntohl(end_addr);
+      fprintf(stdout, "start %u, end %u, start_str: %s, end_str: %s\n",
+              *start, *end, start_str, end_str);
+    }
+
+  return 0;
+}
+
+static void max_fds(void)
+{
+  FILE *proc_max;
+  const char *proc_max_file = "/proc/sys/fs/file-max";
+
+  proc_max = fopen(proc_max_file, "r");
+  if (proc_max) {
+    char buf[BUFSIZ];
+    size_t read = 0;
+
+    read = fread(buf, 1, sizeof(buf), proc_max);
+    fclose(proc_max);
+    if (read) {
+      int max_files;
+      struct rlimit rlim;
+
+      buf[read] = '\0';
+      max_files = atoi(buf);
+
+      rlim.rlim_cur = rlim.rlim_max = max_files;
+
+      if (setrlimit(RLIMIT_NOFILE, &rlim)) {
+        fprintf(stderr, "Failed to set NOFILE to %d: %s",
+                max_files, strerror(errno));
+      }
+    } else {
+      fprintf(stderr, "Failed to read %s\n", proc_max_file);
+    }
+  }
+  else {
+    fprintf(stderr, "Failed to open %s: %s\n", proc_max_file, strerror(errno));
+  }
+}
+
 int main(int argc, char **argv)
 {
   int i, k, l, count = 0, speed;
@@ -1364,7 +1573,7 @@ int main(int argc, char **argv)
   if (argc > 1) {
     k = 1;
     while((opt = getopt(argc, argv,
-			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:s:D:Q:L:K:uR:m:T:rq64xI:S:bB:C:oOG"))
+			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:s:D:Q:L:K:uR:m:T:rq64xI:S:bB:C:oOGUM:"))
 	  != EOF) {
       switch(opt) {
       case 'V':
@@ -1413,6 +1622,11 @@ int main(int argc, char **argv)
 	if (argv[k] == (char *)NULL)
           usage();
         e_lip = strdup(argv[k]);
+        k++;
+        break;
+      case 'M':
+        k++;
+        e_sip = optarg;
         k++;
         break;
       case 'R':
@@ -1702,6 +1916,9 @@ int main(int argc, char **argv)
         k++;
         e_gstats = 1;
         break;
+      case 'U':
+        max_fds();
+        break;
       default:
         usage();
         break;
@@ -1770,24 +1987,12 @@ int main(int argc, char **argv)
   }
 
   if (e_ip_start && e_ip_end) {
-    int start, end;
+    uint32_t start, end;
     char *scope = NULL;
 
-    if (!e_force_ip4 && is_ip6(e_ip_start))
-      e_want_ip6 = 1;
-
-    if (e_want_ip6) {
-      if (strchr(e_ip_start, '%')) {
-        scope = strdup(strchr(e_ip_start, '%'));
-        *strchr(e_ip_start, '%') = '\0';
-        if (strchr(e_ip_end, '%'))
-          *strchr(e_ip_end, '%') = '\0';
-      }
-      start = strtol(strrchr(e_ip_start, ':') + 1, (char **)NULL, 16);
-      end = strtol(strrchr(e_ip_end, ':') + 1, (char **)NULL, 16);
-    } else {
-      start = atoi(strrchr(e_ip_start, '.') + 1);
-      end = atoi(strrchr(e_ip_end, '.') + 1);
+    if (solve_separated_start_and_end(&start, &end, e_ip_start, e_ip_end,
+                                      &scope)) {
+      exit(1);
     }
 
 #ifndef MAX_SOCKETS
@@ -1810,8 +2015,9 @@ int main(int argc, char **argv)
         *strrchr(tmp, ':') = '\0';
         snprintf(ip, sizeof(ip) - 1, "%s:%x%s", tmp, k, scope ? scope : "");
       } else {
-        *strrchr(tmp, '.') = '\0';
-        snprintf(ip, sizeof(ip) - 1, "%s.%d", tmp, k);
+        uint32_t ip_netbyte = htonl(k);
+
+        inet_ntop(AF_INET, &ip_netbyte, ip, sizeof(ip));
       }
 
       for (l = e_port; l <= e_port_end; l++) {
@@ -2158,24 +2364,12 @@ void server(void)
 #endif /* MAX_SOCKETS */
 
   if (e_lip_start && e_lip_end) {
-    int start, end;
-    char *scope = NULL;
+    uint32_t start, end;
+    char *scope;
 
-    if (!e_force_ip4 && is_ip6(e_lip_start))
-      e_want_ip6 = 1;
-
-    if (e_want_ip6) {
-      if (strchr(e_lip_start, '%')) {
-        scope = strdup(strchr(e_lip_start, '%'));
-        *strchr(e_lip_start, '%') = '\0';
-        if (strchr(e_lip_end, '%'))
-          *strchr(e_lip_end, '%') = '\0';
-      }
-      start = strtol(strrchr(e_lip_start, ':') + 1, (char **)NULL, 16);
-      end = strtol(strrchr(e_lip_end, ':') + 1, (char **)NULL, 16);
-    } else {
-      start = atoi(strrchr(e_lip_start, '.') + 1);
-      end = atoi(strrchr(e_lip_end, '.') + 1);
+    if (solve_separated_start_and_end(&start, &end, e_lip_start,
+                                      e_lip_end, &scope)) {
+        exit(1);
     }
 
 #ifndef MAX_SOCKETS
@@ -2197,12 +2391,13 @@ void server(void)
         *strrchr(tmp, ':') = '\0';
         snprintf(ip, sizeof(ip) - 1, "%s:%x%s", tmp, k, scope ? scope : "");
       } else {
-        *strrchr(tmp, '.') = '\0';
-        snprintf(ip, sizeof(ip) - 1, "%s.%d", tmp, k);
+        uint32_t ip_netbyte = htonl(k);
+
+        inet_ntop(AF_INET, &ip_netbyte, ip, sizeof(ip));
       }
 
       for (l = e_lport; l <= e_lport_end; l++) {
-	if (create_server(l, ip, count, &s, e_port, e_host) < 0)
+	if (create_server(l, ip, count, &s, e_port, e_host, e_sip) < 0)
 	  exit(1);
 
 	if (!e_flood)
@@ -2225,7 +2420,7 @@ void server(void)
 
     /* create the sockets */
     for (l = e_lport; l <= e_lport_end; l++) {
-      if (create_server(l, e_lip, count, &s, e_port, e_host) < 0)
+      if (create_server(l, e_lip, count, &s, e_port, e_host, e_sip) < 0)
 	exit(1);
 
       if (!e_flood)
@@ -2890,8 +3085,11 @@ struct socket_conn *add_conn(struct sockets *s, int sock, c_sockaddr *remote,
 #endif /* IP_TOS */
 
   /* Set TTL */
-  if (e_ttl != -1 && e_ttl)
-    set_sockopt(sock, IPPROTO_IP, IP_TTL, e_ttl);
+  if (e_ttl != -1 && e_ttl) {
+    int option = is_mc(remote, e_want_ip6) ? IP_MULTICAST_TTL : IP_TTL;
+
+    set_sockopt(sock, IPPROTO_IP, option, e_ttl);
+  }
 
   if (e_proto == SOCK_STREAM) {
     if (!e_quiet && e_threads == 1 && !e_csv)
