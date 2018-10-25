@@ -98,6 +98,7 @@ int e_num_conn;
 int e_data_len;
 int e_send_loop;
 int e_flood, e_data_flood;
+int e_show_src;
 int e_sleep = 1000;
 int e_speed = 0;
 int e_speed_unit = 0;
@@ -839,6 +840,12 @@ int create_server(int port, char *local_ip, int index,
   }
 
   sockets->sockets[index].sock = sock;
+  if (local_ip && e_proto == SOCK_DGRAM) {
+    inet_pton(e_sock_type, local_ip, (e_sock_type == AF_INET6) ?
+              (void *)&sockets->sockets[index].udp_src.sin6.sin6_addr :
+              (void *)&sockets->sockets[index].udp_src.sin.sin_addr);
+    sockets->sockets[index].udp_src.sa.sa_family = e_sock_type;
+  }
 
   return sock;
 }
@@ -1260,6 +1267,7 @@ void usage_help(void)
   printf(" -6               Use/prefer IPv6 addresses\n");
   printf(" -4               Force IPv4 (no IPv6 support)\n");
   printf(" -x               Hexdump the data to be sent to stdout\n");
+  printf(" -y               Display UDP src instead of pointer on statistics\n");
   printf(" -?               Display help and examples, then exit\n");
   printf(" -V               Display version, then exit\n");
 
@@ -1334,6 +1342,9 @@ void usage_examples(void)
   printf("      conntest -P 1 -r -h 1.1.1.1\n");
   printf("      conntest -P raw -r -D 0x45000000000000000001 -h 1.1.1.1\n");
   printf("      conntest -P raw -r -D 0x4500000000000000000100000000000001010101\n");
+  printf("  - Send UDP packets to Multicast groups 224.1.0.1-224.1.0.10 from eth0\n");
+  printf("    Note: TTL should be increased over 1.\n");
+  printf("      conntest -H 224.1.0.1-224.1.0.10 -P udp -I eth0 -T 4\n");
 
   printf("\n");
   printf("Server examples:\n");
@@ -1343,6 +1354,8 @@ void usage_examples(void)
   printf("      conntest -S discard -P UDP\n");
   printf("  - Start http server on port 8080:\n");
   printf("      conntest -S http -K 8080 -D /var/htdocs\n");
+  printf("  - Start receiving multicast groups 224.1.0.1-224.1.0.10 on eth0 from source 10.1.0.30:\n");
+  printf("       conntest -I eth0 -S discard -R 224.1.0.1-224.1.0.10 -P udp -M 10.1.0.30\n");
 }
 
 void usage(void)
@@ -1573,7 +1586,7 @@ int main(int argc, char **argv)
   if (argc > 1) {
     k = 1;
     while((opt = getopt(argc, argv,
-			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:s:D:Q:L:K:uR:m:T:rq64xI:S:bB:C:oOGUM:"))
+			"Vh:H:p:P:c:d:l:t:fFA:i:g:a:n:s:D:Q:L:K:uR:m:T:rq64xI:S:bB:C:oOGUM:y"))
 	  != EOF) {
       switch(opt) {
       case 'V':
@@ -1918,6 +1931,9 @@ int main(int argc, char **argv)
         break;
       case 'U':
         max_fds();
+        break;
+      case 'y':
+        e_show_src = 1;
         break;
       default:
         usage();
@@ -2733,6 +2749,15 @@ static void print_gstats(int end)
   g_p_send_pkts = g_send_pkts;
 }
 
+static const char *print_c_sockaddr(c_sockaddr *addr, char *ipstr, size_t len)
+{
+  return inet_ntop(addr->sa.sa_family,
+                   (addr->sa.sa_family == AF_INET6)
+                     ? (void *)&addr->sin6.sin6_addr
+                     : (void *)&addr->sin.sin_addr,
+                   ipstr, len);
+}
+
 static void print_conn(struct socket_conn *conn, struct socket *sock, int end)
 {
   const char *unit;
@@ -2867,7 +2892,14 @@ static void print_conn(struct socket_conn *conn, struct socket *sock, int end)
     conn->hprint = 1;
   }
 
-  if (e_proto == SOCK_STREAM)
+  if (e_show_src && e_proto == SOCK_DGRAM)
+    {
+      char ipstr[INET6_ADDRSTRLEN];
+
+      fprintf(e_output, "[%s]",
+              print_c_sockaddr(&sock->udp_src, ipstr, sizeof(ipstr)));
+    }
+  else if (e_proto == SOCK_STREAM)
     fprintf(e_output, "[%4x]", sock->sock);
   else
     fprintf(e_output, "[%lx]", (unsigned long)conn);
@@ -3157,9 +3189,17 @@ struct socket_conn *add_conn(struct sockets *s, int sock, c_sockaddr *remote,
       conn->next->prev = conn;
     s_sock->conns[hash] = conn;
 
-    if (!e_quiet && e_threads == 1 && !e_csv)
-      fprintf(e_output, "[%lx] Accepting UDP connection from %s:%d\n",
-	      (unsigned long)conn, ip, port);
+    if (!e_quiet && e_threads == 1 && !e_csv) {
+      if (e_show_src) {
+          char ipstr[INET6_ADDRSTRLEN];
+
+          fprintf(e_output, "[%s]", print_c_sockaddr(&s_sock->udp_src, ipstr,
+                                                    sizeof(ipstr)));
+      }
+      else
+          fprintf(e_output, "[%lx]", (unsigned long)conn);
+      fprintf(e_output, " Accepting UDP connection from %s:%d\n", ip, port);
+    }
   }
 
   conn->addr = *remote;
